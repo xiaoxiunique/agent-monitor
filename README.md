@@ -10,6 +10,9 @@ Agent Monitor is local-first. It is meant for localhost, a trusted LAN, or a pri
 
 <table>
   <tr>
+    <td colspan="3"><img src="./screenshots/mac.png" alt="Agent Monitor macOS control center" width="860" /></td>
+  </tr>
+  <tr>
     <td><img src="./screenshots/1.png" alt="Agent Monitor session list" width="280" /></td>
     <td><img src="./screenshots/2.png" alt="Agent Monitor actions view" width="280" /></td>
     <td><img src="./screenshots/3.png" alt="Agent Monitor terminal view" width="280" /></td>
