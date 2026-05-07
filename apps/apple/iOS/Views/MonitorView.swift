@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MonitorView: View {
     @Environment(MonitorStore.self) private var store
+    @Environment(AppSettings.self) private var settings
     @State private var showingSettings = false
 
     private let columns = [
@@ -49,7 +50,7 @@ struct MonitorView: View {
                     ContentUnavailableView(
                         "No tmux panes",
                         systemImage: "terminal",
-                        description: Text(store.errorMessage ?? "Start a tmux session and check Settings.")
+                        description: Text(emptyStateDescription)
                     )
                     .padding()
                 }
@@ -63,6 +64,19 @@ struct MonitorView: View {
                 await store.refresh()
             }
         }
+    }
+
+    private var emptyStateDescription: String {
+        if let errorMessage = store.errorMessage {
+            return errorMessage
+        }
+
+        let serverURL = settings.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if serverURL.isEmpty {
+            return "Configure service URL in Settings."
+        }
+
+        return "Connected to \(serverURL). Start a tmux session or check that this is the same URL as the web dashboard."
     }
 }
 

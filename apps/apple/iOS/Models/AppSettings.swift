@@ -19,7 +19,11 @@ enum DetailTab: String, CaseIterable, Identifiable {
 
 @Observable
 final class AppSettings {
+    #if targetEnvironment(simulator)
+    private static let defaultServerURL = "http://127.0.0.1:8787"
+    #else
     private static let defaultServerURL = ""
+    #endif
 
     var serverURL: String {
         didSet { defaults.set(serverURL, forKey: Keys.serverURL) }
