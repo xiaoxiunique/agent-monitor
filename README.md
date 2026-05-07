@@ -6,6 +6,16 @@ Mobile-friendly monitor and control surface for agent sessions running inside tm
 
 Agent Monitor is local-first. It is meant for localhost, a trusted LAN, or a private Tailscale tailnet. By default it does not require a token.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td><img src="./screenshots/1.png" alt="Agent Monitor session list" width="280" /></td>
+    <td><img src="./screenshots/2.png" alt="Agent Monitor actions view" width="280" /></td>
+    <td><img src="./screenshots/3.png" alt="Agent Monitor terminal view" width="280" /></td>
+  </tr>
+</table>
+
 ## Requirements
 
 - macOS or Linux with tmux
