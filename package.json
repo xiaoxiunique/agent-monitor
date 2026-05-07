@@ -1,6 +1,7 @@
 {
   "name": "agent-monitor",
   "version": "0.1.0",
+  "description": "Mobile-friendly local-first monitor and control surface for Claude Code, Codex, and other tmux-based agent sessions. 面向手机端的本地优先 Agent 监控与控制工具。",
   "license": "MIT",
   "private": true,
   "type": "module",

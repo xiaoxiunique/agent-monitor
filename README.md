@@ -2,6 +2,8 @@
 
 Mobile-friendly monitor and control surface for agent sessions running inside tmux.
 
+面向手机端的本地优先 Agent 监控与控制工具，用来查看和操作运行在 tmux 中的 Claude Code、Codex 等长任务会话。
+
 Agent Monitor is local-first. It is meant for localhost, a trusted LAN, or a private Tailscale tailnet. By default it does not require a token.
 
 ## Requirements
