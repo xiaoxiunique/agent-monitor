@@ -1,0 +1,17 @@
+.DS_Store
+.env
+node_modules
+*.log
+dist
+build
+coverage
+.playwright-cli
+output
+public/assets
+public/index.html
+apps/apple/.build
+apps/apple/dist
+apps/apple/AgentMonitorApple.xcodeproj
+apps/apple/AgentMonitorService/target
+apps/apple/*.dmg
+*.xcuserstate

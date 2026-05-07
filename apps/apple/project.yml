@@ -1,0 +1,52 @@
+name: AgentMonitorApple
+options:
+  bundleIdPrefix: dev.hcg
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+targets:
+  AgentMonitorMac:
+    type: application
+    platform: macOS
+    sources:
+      - Mac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.hcg.AgentMonitorMac
+        PRODUCT_NAME: Agent Monitor
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+    info:
+      path: Mac/Info.plist
+      properties:
+        CFBundleDisplayName: Agent Monitor
+        LSUIElement: true
+        NSHumanReadableCopyright: "Agent Monitor"
+  AgentMonitoriOS:
+    type: application
+    platform: iOS
+    sources:
+      - iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.hcg.AgentMonitor
+        PRODUCT_NAME: Agent Monitor
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    info:
+      path: iOS/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Agent Monitor
+        UILaunchScreen:
+          UIColorName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoadsInWebContent: true
+          NSAllowsLocalNetworking: true
