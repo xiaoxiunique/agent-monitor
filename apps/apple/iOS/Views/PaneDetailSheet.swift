@@ -1,330 +1,4740 @@
 import SwiftUI
+import UIKit
+import PhotosUI
+import ImageIO
 
 struct PaneDetailView: View {
     let pane: Pane
+    let isLiveServer: Bool
+    let serverName: String
 
     @Environment(MonitorStore.self) private var store
     @Environment(\.dismiss) private var dismiss
-    @State private var selectedTab: DetailTab = .actions
+    @Environment(\.colorScheme) private var colorScheme
     @State private var inputText = ""
     @State private var vimMode = false
     @State private var showKillConfirmation = false
+    @State private var showTerminal = false
+    @State private var showInfo = false
+    @State private var showLongContext = false
+    @State private var actionPane: Pane
+    @State private var logRefreshHint: PaneLogRefreshHint?
+    @State private var userMessages: [UserInteractionMessage] = []
 
-    private var currentPane: Pane {
-        store.allPanes.first(where: { $0.id == pane.id }) ?? pane
+    init(pane: Pane, isLiveServer: Bool = true, serverName: String = "Server") {
+        self.pane = pane
+        self.isLiveServer = isLiveServer
+        self.serverName = serverName
+        _actionPane = State(initialValue: pane)
+    }
+
+    private var projectName: String {
+        AppSettings.projectName(from: pane.session)
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if selectedTab != .terminal {
-                Picker("Detail", selection: $selectedTab) {
-                    ForEach(DetailTab.allCases) { tab in
-                        Text(tab.title).tag(tab)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .padding([.horizontal, .top])
+        AgentChatTimelineContainer(
+            initialPane: pane,
+            isLiveServer: isLiveServer,
+            userMessages: userMessages,
+            onOpenTerminal: { openTerminalIfLive() },
+            onOpenLongContext: { openLongContextIfLive() },
+            onSendAction: { payload in
+                guard isLiveServer else { return false }
+                let response = await store.sendText(payload, to: actionPane, vimMode: false)
+                applyCommandLogHint(response)
+                return response?.ok == true
             }
-
-            Group {
-                switch selectedTab {
-                case .actions:
-                    ActionsPaneView(
-                        pane: currentPane,
-                        inputText: $inputText,
-                        vimMode: $vimMode,
-                        showKillConfirmation: $showKillConfirmation
-                    )
-                case .terminal:
-                    TerminalPaneView(pane: currentPane)
-                case .status:
-                    StatusPaneView(pane: currentPane)
-                }
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            AgentMonitorTheme.backgroundGradient(for: colorScheme)
+                .ignoresSafeArea()
+        )
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !isLiveServer {
+                StaleServerBanner(serverName: serverName)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(selectedTab == .terminal ? Color.black : Color(.systemBackground))
-        .navigationTitle(selectedTab == .terminal ? "" : currentPane.session)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            InputBar(
+                pane: actionPane,
+                inputText: $inputText,
+                vimMode: $vimMode,
+                showKillConfirmation: $showKillConfirmation,
+                onSendText: { text in
+                    guard isLiveServer else { return false }
+                    let response = await store.sendText(text, to: actionPane, vimMode: vimMode)
+                    applyCommandLogHint(response)
+                    return response?.ok == true
+                },
+                onUserMessageSent: rememberUserMessage,
+                onRefineText: { text in
+                    await store.refineText(text)
+                },
+                onSendKey: { key in
+                    guard isLiveServer else { return false }
+                    let response = await store.sendKey(key, to: actionPane)
+                    applyCommandLogHint(response)
+                    return response?.ok == true
+                },
+                onUploadImage: { imageData in
+                    guard isLiveServer else { throw CancellationError() }
+                    return try await store.uploadImage(imageData, to: actionPane)
+                }
+            )
+        }
+        .navigationTitle(projectName)
         .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(selectedTab == .terminal)
         .toolbar {
-            if selectedTab == .terminal {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.title3.weight(.semibold))
+            ToolbarItem(placement: .topBarTrailing) {
+                HStack(spacing: 16) {
+                    Button { showLongContext = true } label: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 16))
                     }
-                    .tint(.white)
-                    .accessibilityLabel("Back")
+                    .disabled(!isLiveServer)
+                    .accessibilityLabel("Open longer context")
+
+                    Button { showTerminal = true } label: {
+                        Image(systemName: "terminal")
+                            .font(.system(size: 16))
+                    }
+                    .disabled(!isLiveServer)
+                    Button { showInfo = true } label: {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 16))
+                    }
                 }
             }
         }
-        .toolbarBackground(selectedTab == .terminal ? .hidden : .automatic, for: .navigationBar)
         .confirmationDialog(
-            "Kill tmux session \(currentPane.session)?",
+            "Close pane \(actionPane.id)?",
             isPresented: $showKillConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Kill Session", role: .destructive) {
+            Button("Close Pane", role: .destructive) {
                 Task {
-                    await store.killSession(currentPane.session)
-                    dismiss()
+                    guard isLiveServer else {
+                        Haptics.sent(success: false)
+                        return
+                    }
+                    if await store.closePane(actionPane) {
+                        dismiss()
+                    }
                 }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This closes every window and pane in that tmux session.")
+            Text("This closes this tmux pane. Other panes in the same project stay available.")
         }
-        .task(id: selectedTab) {
-            guard selectedTab != .terminal else { return }
-            while !Task.isCancelled {
-                await store.refresh(showLoading: false)
-                try? await Task.sleep(for: .milliseconds(500))
+        .sheet(isPresented: $showLongContext) {
+            NavigationStack {
+                LongContextView(pane: actionPane)
+                    .navigationTitle("Long Context")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { showLongContext = false }
+                        }
+                    }
             }
         }
-    }
-}
-
-private struct StatusPaneView: View {
-    let pane: Pane
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Label(pane.status.title, systemImage: "circle.fill")
-                        .foregroundStyle(statusColor(pane.status))
-                    Spacer()
-                    Text(pane.updatedAt, style: .time)
-                        .foregroundStyle(.secondary)
-                }
-                .font(.subheadline.weight(.semibold))
-
-                MetadataGrid(pane: pane)
-
-                Text(pane.tail.isEmpty ? "No output yet." : pane.tail)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .sheet(isPresented: $showTerminal) {
+            NavigationStack {
+                TerminalPaneView(pane: actionPane)
+                    .navigationTitle("Terminal")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { showTerminal = false }
+                        }
+                    }
             }
-            .padding()
         }
+        .sheet(isPresented: $showInfo) {
+            NavigationStack {
+                PaneInfoView(pane: actionPane)
+                    .navigationTitle("Info")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { showInfo = false }
+                        }
+                    }
+            }
+        }
+        .background {
+            PaneActionSync(initialPane: pane, actionPane: $actionPane, isLiveServer: isLiveServer)
+        }
+    }
+
+    private func applyCommandLogHint(_ response: PaneCommandResponse?) {
+        guard let response,
+              response.ok,
+              response.paneId == actionPane.id,
+              let tail = response.tail,
+              let capturedAt = response.capturedAt
+        else { return }
+
+        logRefreshHint = PaneLogRefreshHint(paneId: actionPane.id, tail: tail, capturedAt: capturedAt)
+    }
+
+    private func rememberUserMessage(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        userMessages.append(UserInteractionMessage(text: trimmed, sentAt: Date()))
+        if userMessages.count > 40 {
+            userMessages.removeFirst(userMessages.count - 40)
+        }
+    }
+
+    private func openTerminalIfLive() {
+        guard isLiveServer else {
+            Haptics.sent(success: false)
+            return
+        }
+        showTerminal = true
+    }
+
+    private func openLongContextIfLive() {
+        guard isLiveServer else {
+            Haptics.sent(success: false)
+            return
+        }
+        showLongContext = true
     }
 }
 
-private struct MetadataGrid: View {
-    let pane: Pane
-
-    var body: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            MetadataTile(title: "Command", value: pane.command.isEmpty ? "shell" : pane.command)
-            MetadataTile(title: "Pane", value: pane.id)
-            MetadataTile(title: "Target", value: pane.target)
-            MetadataTile(title: "PID", value: pane.pid.map(String.init) ?? "-")
-            MetadataTile(title: "Path", value: pane.path)
-                .gridCellColumns(2)
-        }
-    }
-}
-
-private struct MetadataTile: View {
-    let title: String
-    let value: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.caption.weight(.semibold))
-                .lineLimit(2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(11)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-}
-
-private struct ActionsPaneView: View {
-    let pane: Pane
-    @Binding var inputText: String
-    @Binding var vimMode: Bool
-    @Binding var showKillConfirmation: Bool
+private struct PaneActionSync: View {
+    let initialPane: Pane
+    @Binding var actionPane: Pane
+    let isLiveServer: Bool
 
     @Environment(MonitorStore.self) private var store
-    @FocusState private var composerFocused: Bool
+
+    private var currentPane: Pane {
+        guard isLiveServer else { return initialPane }
+        return store.allPanes.first(where: { $0.id == initialPane.id }) ?? initialPane
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            LatestTerminalTail(pane: pane)
-                .frame(maxHeight: .infinity)
-                .padding(.horizontal, 12)
-                .padding(.top, 12)
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                updateActionPaneIfNeeded(from: currentPane)
+            }
+            .onChange(of: currentPane) { _, pane in
+                updateActionPaneIfNeeded(from: pane)
+            }
+    }
 
-            QuickReplyComposer(
-                pane: pane,
-                inputText: $inputText,
-                vimMode: $vimMode,
-                composerFocused: $composerFocused,
-                showKillConfirmation: $showKillConfirmation
-            )
+    private func updateActionPaneIfNeeded(from pane: Pane) {
+        if actionPane.identityForActions != pane.identityForActions {
+            actionPane = pane
         }
-        .background(Color(.systemGroupedBackground))
     }
 }
 
-private struct LatestTerminalTail: View {
-    let pane: Pane
+private struct StaleServerBanner: View {
+    let serverName: String
 
-    private var output: String {
-        pane.tail.isEmpty ? "No output yet." : pane.tail
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 13, weight: .semibold))
+            Text("Waiting for \(serverName) to become active. Actions are paused for this snapshot.")
+                .font(.system(size: 12, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .foregroundColor(.orange)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct PaneLogRefreshHint: Equatable {
+    let id = UUID()
+    let paneId: String
+    let tail: String
+    let capturedAt: Date
+
+    static func == (lhs: PaneLogRefreshHint, rhs: PaneLogRefreshHint) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
+// MARK: - Agent Chat Timeline
+
+private struct AgentChatTimelineContainer: View {
+    let initialPane: Pane
+    let isLiveServer: Bool
+    let userMessages: [UserInteractionMessage]
+    let onOpenTerminal: () -> Void
+    let onOpenLongContext: () -> Void
+    let onSendAction: (String) async -> Bool
+
+    @Environment(MonitorStore.self) private var store
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var followTailRequest = 0
+
+    private var currentPane: Pane {
+        guard isLiveServer else { return initialPane }
+        return store.allPanes.first(where: { $0.id == initialPane.id }) ?? initialPane
     }
 
     var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    AgentOverviewPanel(
+                        session: currentPane.session,
+                        status: currentPane.status,
+                        title: currentPane.title,
+                        reason: currentPane.reason,
+                        tail: currentPane.tail,
+                        updatedAt: currentPane.updatedAt,
+                        interpretedMessages: currentPane.messages ?? [],
+                        isLiveServer: isLiveServer
+                    )
+
+                    ForEach(chatEvents) { event in
+                        switch event {
+                        case let .agent(message):
+                            AgentMessageBubble(
+                                session: currentPane.session,
+                                status: currentPane.status,
+                                kind: message.kind,
+                                title: message.title,
+                                message: message.body,
+                                updatedAt: message.createdAt,
+                                actions: message.actions,
+                                actionsEnabled: isLiveServer,
+                                onOpenTerminal: onOpenTerminal,
+                                onOpenLongContext: onOpenLongContext,
+                                onSendAction: onSendAction
+                            )
+                        case let .user(message):
+                            UserMessageBubble(message: message)
+                        }
+                    }
+
+                    LastOutputCard(
+                        tail: currentPane.tail,
+                        isTerminalAvailable: isLiveServer,
+                        onOpenTerminal: onOpenTerminal
+                    )
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id("chat-tail")
+                }
+                .padding(.bottom, 12)
+            }
+            .background(Color.clear)
+            .onAppear {
+                scrollToTail(proxy, animated: false)
+            }
+            .onChange(of: chatEvents) { _, _ in
+                scrollToTail(proxy, animated: true)
+            }
+            .onChange(of: currentPane.updatedAt) { _, _ in
+                followTailRequest += 1
+                scrollToTail(proxy, animated: true)
+            }
+        }
+    }
+
+    private var chatEvents: [AgentChatEvent] {
+        let interpretedMessages = currentPane.messages ?? []
+        let sourceMessages = interpretedMessages.isEmpty
+            ? fallbackInteractionMessages(for: currentPane)
+            : interpretedMessages
+        let visibleSourceMessages = visibleAgentMessages(from: sourceMessages)
+        let agentMessages = visibleSourceMessages.isEmpty
+            ? visibleAgentMessages(from: fallbackInteractionMessages(for: currentPane))
+            : visibleSourceMessages
+        let agentEvents = agentMessages
+            .map(AgentChatEvent.agent)
+        let userEvents = userMessages.map(AgentChatEvent.user)
+        return (agentEvents + userEvents).sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+            if lhs.sortRank != rhs.sortRank { return lhs.sortRank < rhs.sortRank }
+            return lhs.id < rhs.id
+        }
+    }
+
+    private func visibleAgentMessages(from messages: [InteractionMessage]) -> [InteractionMessage] {
+        messages.filter { message in
+            message.kind != .summary
+                && !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    private func fallbackInteractionMessages(for pane: Pane) -> [InteractionMessage] {
+        let body = LocalSummary.feedback(status: pane.status, title: cleanTaskTitle(pane.title), reason: pane.reason, tail: pane.tail)
+        return [
+            InteractionMessage(
+                id: "local-\(pane.id)-\(pane.status.rawValue)-\(pane.updatedAt.timeIntervalSince1970)",
+                paneId: pane.id,
+                role: .agent,
+                kind: fallbackKind(for: pane.status),
+                priority: pane.status == .waiting || pane.status == .failed ? .high : .normal,
+                title: LocalSummary.feedbackTitle(status: pane.status),
+                body: body,
+                actions: nil,
+                source: nil,
+                createdAt: pane.updatedAt
+            )
+        ]
+    }
+
+    private func fallbackKind(for status: PaneStatus) -> InteractionMessageKind {
+        switch status {
+        case .waiting: .question
+        case .failed: .error
+        case .done: .done
+        case .running: .progress
+        case .idle: .status
+        }
+    }
+
+    private func scrollToTail(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.22)) {
+                    proxy.scrollTo("chat-tail", anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo("chat-tail", anchor: .bottom)
+            }
+        }
+    }
+}
+
+private enum AgentChatEvent: Identifiable, Equatable {
+    case agent(InteractionMessage)
+    case user(UserInteractionMessage)
+
+    var id: String {
+        switch self {
+        case let .agent(message): "agent-\(message.id)"
+        case let .user(message): "user-\(message.id)"
+        }
+    }
+
+    var createdAt: Date {
+        switch self {
+        case let .agent(message): message.createdAt
+        case let .user(message): message.sentAt
+        }
+    }
+
+    var sortRank: Int {
+        switch self {
+        case .agent: 0
+        case .user: 1
+        }
+    }
+}
+
+// MARK: - Realtime Log
+
+private struct PaneRealtimeLogContainer: View {
+    private static let realtimeLogLineLimit = 800
+
+    let initialPane: Pane
+    let refreshHint: PaneLogRefreshHint?
+
+    @Environment(MonitorStore.self) private var store
+    @State private var paneLogService = PaneLogWebSocketService()
+    @State private var displayStatus: PaneStatus
+    @State private var displayReason: String
+    @State private var displayLogText: String
+    @State private var displayUpdatedAt: Date
+    @State private var logRuntime: PaneRealtimeLogRuntime
+    @State private var isLogUserScrolling = false
+    @State private var isLogFollowingTail = true
+    @State private var followTailRequest = 0
+
+    init(initialPane: Pane, refreshHint: PaneLogRefreshHint? = nil) {
+        self.initialPane = initialPane
+        self.refreshHint = refreshHint
+        _displayStatus = State(initialValue: initialPane.status)
+        _displayReason = State(initialValue: initialPane.reason)
+        _displayLogText = State(initialValue: LogText.compact(initialPane.tail, limit: Self.realtimeLogLineLimit))
+        _displayUpdatedAt = State(initialValue: initialPane.updatedAt)
+        _logRuntime = State(initialValue: PaneRealtimeLogRuntime(latestLogCapturedAt: initialPane.updatedAt))
+    }
+
+    private var currentPane: Pane {
+        store.allPanes.first(where: { $0.id == initialPane.id }) ?? initialPane
+    }
+
+    var body: some View {
+        RealtimeLogPanel(
+            status: displayStatus,
+            reason: displayReason,
+            logText: displayLogText,
+            updatedAt: displayUpdatedAt,
+            followTailRequest: followTailRequest,
+            isUserScrolling: $isLogUserScrolling,
+            isFollowingTail: $isLogFollowingTail
+        )
+        .onAppear {
+            updateDisplayState(from: currentPane)
+            connectPaneLogStreamIfPossible()
+        }
+        .onChange(of: currentPane) { _, pane in
+            updateDisplayState(from: pane)
+        }
+        .onChange(of: refreshHint) { _, hint in
+            applyRefreshHint(hint)
+        }
+        .onDisappear {
+            logRuntime.cancelTasks()
+            paneLogService.onEvent = nil
+            paneLogService.onStateChange = nil
+            paneLogService.disconnect()
+        }
+    }
+
+    private func updateDisplayState(from pane: Pane) {
+        if pane.status != displayStatus {
+            displayStatus = pane.status
+        }
+        if pane.reason != displayReason { displayReason = pane.reason }
+        if !logRuntime.hasFreshRealtimeLogStream {
+            let nextLogText = LogText.compact(pane.tail, limit: Self.realtimeLogLineLimit)
+            applyIncomingLogText(nextLogText, capturedAt: pane.updatedAt)
+            if pane.updatedAt >= displayUpdatedAt {
+                displayUpdatedAt = pane.updatedAt
+            }
+        }
+    }
+
+    private func connectPaneLogStreamIfPossible() {
+        guard let client = store.makeClient() else { return }
+        logRuntime.reconnectTask?.cancel()
+        paneLogService.onEvent = { event in
+            guard event.paneId == initialPane.id else { return }
+            logRuntime.hasRealtimeLogStream = true
+            logRuntime.lastRealtimeLogEventAt = Date()
+            applyRealtimeLogEvent(event)
+        }
+        paneLogService.onStateChange = { state in
+            switch state {
+            case .disconnected:
+                logRuntime.hasRealtimeLogStream = false
+                refreshLogFallbackSoon(after: 120)
+                schedulePaneLogReconnect()
+            case .error:
+                logRuntime.hasRealtimeLogStream = false
+                refreshLogFallbackSoon(after: 120)
+                schedulePaneLogReconnect()
+            case .connecting, .connected:
+                break
+            }
+        }
+        paneLogService.connect(with: .init(
+            baseURL: client.baseURL,
+            token: client.token,
+            paneId: initialPane.id,
+            lines: Self.realtimeLogLineLimit
+        ))
+    }
+
+    private func applyRefreshHint(_ hint: PaneLogRefreshHint?) {
+        guard let hint, hint.paneId == initialPane.id else { return }
+        requestImmediateLogRefresh()
+        let nextLogText = LogText.compact(hint.tail, limit: Self.realtimeLogLineLimit)
+        guard !shouldIgnoreCommandLogHint(nextLogText) else { return }
+        applyIncomingLogText(nextLogText, capturedAt: hint.capturedAt)
+    }
+
+    private func shouldIgnoreCommandLogHint(_ nextLogText: String) -> Bool {
+        guard !displayLogText.isEmpty, !nextLogText.isEmpty else { return false }
+        if LogText.looksOlder(nextLogText, than: displayLogText) {
+            return true
+        }
+
+        let currentLineCount = LogText.lineCount(displayLogText)
+        let nextLineCount = LogText.lineCount(nextLogText)
+        return currentLineCount >= 420 && nextLineCount + 160 < currentLineCount
+    }
+
+    private func applyRealtimeLogEvent(_ event: PaneLogWebSocketService.Event) {
+        guard event.paneId == initialPane.id else { return }
+        let nextLogText = LogText.compact(event.tail, limit: Self.realtimeLogLineLimit)
+        applyIncomingLogText(nextLogText, capturedAt: event.capturedAt)
+    }
+
+    private func schedulePaneLogReconnect() {
+        logRuntime.reconnectTask?.cancel()
+        logRuntime.reconnectTask = Task {
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                connectPaneLogStreamIfPossible()
+            }
+        }
+    }
+
+    private func refreshLogFallbackSoon(after delayMilliseconds: Int) {
+        logRuntime.fallbackRefreshTask?.cancel()
+        logRuntime.fallbackRefreshTask = Task {
+            if delayMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+            }
+            guard !Task.isCancelled else { return }
+            await refreshLogFallback()
+        }
+    }
+
+    private func requestImmediateLogRefresh() {
+        logRuntime.fallbackRefreshTask?.cancel()
+        paneLogService.requestRefresh()
+        if !logRuntime.hasFreshRealtimeLogStream {
+            refreshLogFallbackSoon(after: 120)
+            schedulePaneLogReconnect()
+        }
+    }
+
+    private func refreshLogFallback() async {
+        guard let response = try? await store.loadPaneContext(currentPane, lines: Self.realtimeLogLineLimit) else {
+            return
+        }
+        guard response.paneId == initialPane.id else { return }
+        let nextLogText = LogText.compact(response.tail, limit: Self.realtimeLogLineLimit)
+        await MainActor.run {
+            applyIncomingLogText(nextLogText, capturedAt: response.capturedAt)
+        }
+    }
+
+    private func applyIncomingLogText(_ incomingLogText: String, capturedAt: Date, force: Bool = false) {
+        if !force, incomingLogText.isEmpty, !displayLogText.isEmpty {
+            return
+        }
+        applyLogText(incomingLogText, capturedAt: capturedAt, force: force)
+    }
+
+    private func applyLogText(_ nextLogText: String, capturedAt: Date, force: Bool = false) {
+        let textChanged = nextLogText != displayLogText
+
+        if !textChanged {
+            return
+        }
+
+        if !force, capturedAt < logRuntime.latestLogCapturedAt {
+            guard LogText.looksNewer(nextLogText, than: displayLogText) else {
+                return
+            }
+        }
+
+        if capturedAt > logRuntime.latestLogCapturedAt {
+            logRuntime.latestLogCapturedAt = capturedAt
+        }
+        if capturedAt >= displayUpdatedAt, displayUpdatedAt != capturedAt {
+            displayUpdatedAt = capturedAt
+        }
+
+        let shouldFollowTail = force || (isLogFollowingTail && !isLogUserScrolling)
+        displayLogText = nextLogText
+        if shouldFollowTail {
+            followTailRequest &+= 1
+        }
+    }
+}
+
+@MainActor
+private final class PaneRealtimeLogRuntime {
+    var hasRealtimeLogStream = false
+    var lastRealtimeLogEventAt = Date.distantPast
+    var latestLogCapturedAt: Date
+    var reconnectTask: Task<Void, Never>?
+    var fallbackRefreshTask: Task<Void, Never>?
+
+    init(latestLogCapturedAt: Date) {
+        self.latestLogCapturedAt = latestLogCapturedAt
+    }
+
+    var hasFreshRealtimeLogStream: Bool {
+        hasRealtimeLogStream && Date().timeIntervalSince(lastRealtimeLogEventAt) < 4
+    }
+
+    func cancelTasks() {
+        reconnectTask?.cancel()
+        fallbackRefreshTask?.cancel()
+        reconnectTask = nil
+        fallbackRefreshTask = nil
+    }
+}
+
+private struct RealtimeLogPanel: View {
+    let status: PaneStatus
+    let reason: String
+    let logText: String
+    let updatedAt: Date
+    let followTailRequest: Int
+    @Binding var isUserScrolling: Bool
+    @Binding var isFollowingTail: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(statusColor(status))
+                    .frame(width: 8, height: 8)
+
+                Text(status.title)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(statusColor(status))
+
+                if !reason.isEmpty {
+                    Text(reason)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.56))
+                        .lineLimit(1)
+                }
+
+                Text(updatedAt, style: .relative)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.48))
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(Color(red: 0.055, green: 0.055, blue: 0.06))
+
+            TerminalLogTextView(
+                text: logText,
+                deferUpdatesWhileAwayFromTail: true,
+                followTailRequest: followTailRequest,
+                isUserScrolling: $isUserScrolling,
+                isFollowingTail: $isFollowingTail
+            )
+                .contextMenu {
+                    Button {
+                        copyToPasteboard(logText)
+                    } label: {
+                        Label("Copy Visible Log", systemImage: "doc.on.doc")
+                    }
+                }
+                .overlay(alignment: .topLeading) {
+                    if logText.isEmpty {
+                        Text("No runtime output yet.")
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.46))
+                            .padding(12)
+                            .allowsHitTesting(false)
+                    }
+            }
+            .background(Color.black)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        UIPasteboard.general.string = text
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+}
+
+@MainActor
+private enum LogPanelDiagnostics {
+    private static var lastLoggedAt = Date.distantPast
+    private static var skippedCount = 0
+
+    static func logApply(mode: String, characters: Int, forceBottom: Bool, nearBottom: Bool) {
+        #if DEBUG
+        let now = Date()
+        if mode == "append" || mode == "replace" || now.timeIntervalSince(lastLoggedAt) > 1.0 {
+            let skippedSuffix = skippedCount > 0 ? " skipped=\(skippedCount)" : ""
+            print("[LogPanelTiming] mode=\(mode) chars=\(characters) forceBottom=\(forceBottom) nearBottom=\(nearBottom)\(skippedSuffix)")
+            lastLoggedAt = now
+            skippedCount = 0
+        } else {
+            skippedCount += 1
+        }
+        #endif
+    }
+}
+
+private struct TerminalLogTextView: UIViewRepresentable {
+    let text: String
+    let deferUpdatesWhileAwayFromTail: Bool
+    let followTailRequest: Int
+    @Binding var isUserScrolling: Bool
+    @Binding var isFollowingTail: Bool
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.backgroundColor = .black
+        textView.textColor = UIColor(red: 0.82, green: 0.95, blue: 0.82, alpha: 1)
+        textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textContainerInset = UIEdgeInsets(top: 10, left: 12, bottom: 14, right: 12)
+        textView.textContainer.lineFragmentPadding = 0
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isScrollEnabled = true
+        textView.showsVerticalScrollIndicator = true
+        textView.alwaysBounceVertical = true
+        textView.keyboardDismissMode = .interactive
+        textView.adjustsFontForContentSizeCategory = false
+        textView.delegate = context.coordinator
+        context.coordinator.textView = textView
+        context.coordinator.isUserScrolling = $isUserScrolling
+        context.coordinator.isFollowingTail = $isFollowingTail
+        context.coordinator.deferUpdatesWhileAwayFromTail = deferUpdatesWhileAwayFromTail
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.isUserScrolling = $isUserScrolling
+        context.coordinator.isFollowingTail = $isFollowingTail
+        context.coordinator.deferUpdatesWhileAwayFromTail = deferUpdatesWhileAwayFromTail
+        context.coordinator.followTailRequest = followTailRequest
+
+        if context.coordinator.didAppear == false {
+            context.coordinator.applyText(text, to: textView, forceBottom: true)
+            context.coordinator.didAppear = true
+            return
+        }
+
+        if context.coordinator.lastFollowTailRequest == nil {
+            context.coordinator.lastFollowTailRequest = followTailRequest
+        }
+
+        if followTailRequest != context.coordinator.lastFollowTailRequest {
+            context.coordinator.lastFollowTailRequest = followTailRequest
+            if context.coordinator.isUserInteracting(with: textView) {
+                if text != context.coordinator.lastAppliedText {
+                    context.coordinator.queueIncomingText(text, to: textView)
+                }
+            } else {
+                context.coordinator.applyText(text, to: textView, forceBottom: true)
+            }
+        } else if text != context.coordinator.lastAppliedText {
+            if context.coordinator.shouldDeferIncomingText(for: textView) {
+                context.coordinator.queueIncomingText(text, to: textView)
+            } else {
+                context.coordinator.applyText(text, to: textView)
+            }
+        } else {
+            context.coordinator.updateFollowingState(for: textView)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UITextViewDelegate {
+        private static let postScrollUpdateDelay: TimeInterval = 0.32
+        private static let awayFromTailCoalesceDelay: TimeInterval = 0.7
+        var didAppear = false
+        var isTrackingUserScroll = false
+        var isUserScrolling: Binding<Bool>?
+        var isFollowingTail: Binding<Bool>?
+        var deferUpdatesWhileAwayFromTail = false
+        var followTailRequest = 0
+        var lastFollowTailRequest: Int?
+        var lastAppliedText = ""
+        var pendingText: String?
+        var deferIncomingTextUntil = Date.distantPast
+        var pendingApplyTask: Task<Void, Never>?
+        private var isApplyingProgrammaticUpdate = false
+        weak var textView: UITextView?
+
+        deinit {
+            pendingApplyTask?.cancel()
+        }
+
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            pendingApplyTask?.cancel()
+            setUserScrolling(true)
+            updateFollowingState(for: scrollView)
+        }
+
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            guard !isApplyingProgrammaticUpdate else { return }
+            updateFollowingState(for: scrollView)
+        }
+
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+            if !decelerate {
+                finishUserScroll()
+            }
+        }
+
+        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            finishUserScroll()
+        }
+
+        func isUserInteracting(with scrollView: UIScrollView) -> Bool {
+            scrollView.isDragging || scrollView.isTracking || scrollView.isDecelerating || isTrackingUserScroll
+        }
+
+        func applyText(_ text: String, to textView: UITextView, forceBottom: Bool = false) {
+            if text == lastAppliedText {
+                if forceBottom {
+                    performProgrammaticUpdate {
+                        textView.layoutIfNeeded()
+                        textView.scrollToBottom(animated: false)
+                    }
+                }
+                pendingText = nil
+                updateFollowingState(for: textView)
+                return
+            }
+
+            let shouldStickToBottom = forceBottom || textView.isNearBottom
+            let previousOffset = textView.contentOffset
+            let previousContentHeight = textView.contentSize.height
+            let visibleAnchor = shouldStickToBottom ? nil : textView.visibleTextAnchor()
+            let appendDelta = appendedSuffix(from: lastAppliedText, to: text)
+            let slideDelta = slidingWindowDelta(from: lastAppliedText, to: text)
+            let replaceMode = shouldReplaceVisibleWindow(from: lastAppliedText, to: text)
+            let canAppendText = !replaceMode && !appendDelta.isEmpty && textView.text == lastAppliedText
+            let canSlideText = !replaceMode && slideDelta != nil && textView.text == lastAppliedText
+            let updateMode = canAppendText ? "append" : canSlideText ? "slide" : replaceMode ? "replace" : "patch"
+
+            performProgrammaticUpdate {
+                if canAppendText {
+                    appendText(appendDelta, to: textView)
+                } else if let slideDelta, canSlideText {
+                    slideWindow(using: slideDelta, in: textView)
+                } else if replaceMode {
+                    textView.textStorage.setAttributedString(attributedLogString(text, for: textView))
+                } else {
+                    patchText(from: lastAppliedText, to: text, in: textView)
+                }
+                textView.layoutIfNeeded()
+                if shouldStickToBottom {
+                    textView.scrollToBottom(animated: false)
+                } else if let visibleAnchor {
+                    textView.restoreVisibleTextAnchor(visibleAnchor)
+                } else {
+                    textView.restoreContentAnchor(previousOffset, previousContentHeight: previousContentHeight)
+                }
+            }
+
+            if !shouldStickToBottom {
+                DispatchQueue.main.async { [weak self, weak textView] in
+                    guard let self, let textView else { return }
+                    self.performProgrammaticUpdate {
+                        if let visibleAnchor {
+                            textView.restoreVisibleTextAnchor(visibleAnchor)
+                        } else {
+                            textView.restoreContentAnchor(previousOffset, previousContentHeight: previousContentHeight)
+                        }
+                    }
+                }
+            }
+
+            lastAppliedText = text
+            pendingText = nil
+            updateFollowingState(for: textView)
+            LogPanelDiagnostics.logApply(mode: updateMode, characters: text.count, forceBottom: forceBottom, nearBottom: textView.isNearBottom)
+        }
+
+        private func performProgrammaticUpdate(_ updates: () -> Void) {
+            isApplyingProgrammaticUpdate = true
+            defer { isApplyingProgrammaticUpdate = false }
+            UIView.performWithoutAnimation(updates)
+        }
+
+        private func appendText(_ text: String, to textView: UITextView) {
+            guard !text.isEmpty else { return }
+            textView.textStorage.append(attributedLogString(text, for: textView))
+        }
+
+        private func patchText(from previousText: String, to nextText: String, in textView: UITextView) {
+            guard textView.text == previousText, !previousText.isEmpty else {
+                textView.textStorage.setAttributedString(attributedLogString(nextText, for: textView))
+                return
+            }
+
+            let diff = diffRange(from: previousText, to: nextText)
+            textView.textStorage.beginEditing()
+            textView.textStorage.replaceCharacters(
+                in: diff.range,
+                with: attributedLogString(diff.replacement, for: textView)
+            )
+            textView.textStorage.endEditing()
+        }
+
+        private func attributedLogString(_ text: String, for textView: UITextView) -> NSAttributedString {
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: textView.font ?? UIFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: textView.textColor ?? UIColor(red: 0.82, green: 0.95, blue: 0.82, alpha: 1)
+            ]
+            return NSAttributedString(string: text, attributes: attributes)
+        }
+
+        private func appendedSuffix(from previousText: String, to nextText: String) -> String {
+            guard !previousText.isEmpty, nextText.hasPrefix(previousText) else { return "" }
+            return String(nextText.dropFirst(previousText.count))
+        }
+
+        private func slidingWindowDelta(from previousText: String, to nextText: String) -> (removeLength: Int, appendText: String)? {
+            guard !previousText.isEmpty, !nextText.isEmpty else { return nil }
+            let previousLines = previousText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            let nextLines = nextText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard previousLines.count > 40, nextLines.count > 40 else { return nil }
+
+            let overlap = LogText.suffixPrefixOverlap(previousLines, nextLines)
+            let minimumOverlap = min(previousLines.count, nextLines.count) * 2 / 3
+            guard overlap >= minimumOverlap,
+                  overlap < previousLines.count,
+                  overlap < nextLines.count
+            else { return nil }
+
+            let removedLineCount = previousLines.count - overlap
+            let removedPrefix = previousLines.prefix(removedLineCount).joined(separator: "\n")
+            var removeLength = removedPrefix.utf16.count
+            if previousLines.count > removedLineCount {
+                removeLength += 1
+            }
+
+            let appendedLines = nextLines.dropFirst(overlap)
+            guard !appendedLines.isEmpty else { return nil }
+            return (removeLength, "\n" + appendedLines.joined(separator: "\n"))
+        }
+
+        private func slideWindow(using delta: (removeLength: Int, appendText: String), in textView: UITextView) {
+            textView.textStorage.beginEditing()
+            textView.textStorage.deleteCharacters(in: NSRange(location: 0, length: min(delta.removeLength, textView.textStorage.length)))
+            textView.textStorage.append(attributedLogString(delta.appendText, for: textView))
+            textView.textStorage.endEditing()
+        }
+
+        private func shouldReplaceVisibleWindow(from previousText: String, to nextText: String) -> Bool {
+            guard !previousText.isEmpty, !nextText.isEmpty else { return false }
+            if nextText.hasPrefix(previousText) || previousText.hasPrefix(nextText) {
+                return false
+            }
+
+            let previousLines = previousText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            let nextLines = nextText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard !previousLines.isEmpty, !nextLines.isEmpty else { return true }
+
+            let sharedPrefix = commonPrefixLineCount(previousLines, nextLines)
+            let sharedSuffix = LogText.suffixPrefixOverlap(previousLines, nextLines)
+            let lineDelta = abs(previousLines.count - nextLines.count)
+            let nextTailMatches = nextLines.suffix(min(12, previousLines.count)).elementsEqual(previousLines.suffix(min(12, nextLines.count)))
+            let previousTailMatches = previousLines.suffix(min(12, nextLines.count)).elementsEqual(nextLines.suffix(min(12, previousLines.count)))
+
+            return sharedPrefix < 2 &&
+                sharedSuffix == 0 &&
+                lineDelta > 24 &&
+                !nextTailMatches &&
+                !previousTailMatches
+        }
+
+        private func commonPrefixLineCount(_ lhs: [String], _ rhs: [String]) -> Int {
+            let limit = min(lhs.count, rhs.count)
+            var count = 0
+            while count < limit, lhs[count] == rhs[count] {
+                count += 1
+            }
+            return count
+        }
+
+        private func diffRange(from previousText: String, to nextText: String) -> (range: NSRange, replacement: String) {
+            var previousStart = previousText.startIndex
+            var nextStart = nextText.startIndex
+
+            while previousStart < previousText.endIndex,
+                  nextStart < nextText.endIndex,
+                  previousText[previousStart] == nextText[nextStart] {
+                previousText.formIndex(after: &previousStart)
+                nextText.formIndex(after: &nextStart)
+            }
+
+            var previousEnd = previousText.endIndex
+            var nextEnd = nextText.endIndex
+            while previousStart < previousEnd,
+                  nextStart < nextEnd {
+                let previousBeforeEnd = previousText.index(before: previousEnd)
+                let nextBeforeEnd = nextText.index(before: nextEnd)
+                guard previousText[previousBeforeEnd] == nextText[nextBeforeEnd] else {
+                    break
+                }
+                previousEnd = previousBeforeEnd
+                nextEnd = nextBeforeEnd
+            }
+
+            let location = previousText[..<previousStart].utf16.count
+            let length = previousText[previousStart..<previousEnd].utf16.count
+            return (
+                NSRange(location: location, length: length),
+                String(nextText[nextStart..<nextEnd])
+            )
+        }
+
+        func cancelPendingTextApply() {
+            pendingApplyTask?.cancel()
+            pendingApplyTask = nil
+        }
+
+        func shouldDeferIncomingText(for textView: UITextView) -> Bool {
+            return isUserInteracting(with: textView)
+                || Date() < deferIncomingTextUntil
+                || (deferUpdatesWhileAwayFromTail && !textView.isNearBottom)
+        }
+
+        func queueIncomingText(_ text: String, to textView: UITextView) {
+            pendingText = text
+            LogPanelDiagnostics.logApply(mode: "defer", characters: text.count, forceBottom: false, nearBottom: textView.isNearBottom)
+            if !isUserInteracting(with: textView) {
+                if deferUpdatesWhileAwayFromTail && !textView.isNearBottom {
+                    deferIncomingTextUntil = maxDate(
+                        deferIncomingTextUntil,
+                        Date().addingTimeInterval(Self.awayFromTailCoalesceDelay)
+                    )
+                }
+                schedulePendingTextApply(to: textView)
+            }
+        }
+
+        func updateFollowingState(for scrollView: UIScrollView) {
+            guard let textView = scrollView as? UITextView else { return }
+            let following = textView.isNearBottom
+            if isFollowingTail?.wrappedValue != following {
+                isFollowingTail?.wrappedValue = following
+            }
+            if following, pendingText != nil, !isUserInteracting(with: textView) {
+                schedulePendingTextApply(to: textView)
+            }
+        }
+
+        private func finishUserScroll() {
+            guard let textView else { return }
+            deferIncomingTextUntil = Date().addingTimeInterval(Self.postScrollUpdateDelay)
+            updateFollowingState(for: textView)
+            defer { setUserScrolling(false) }
+            if pendingText != nil {
+                schedulePendingTextApply(to: textView)
+            }
+        }
+
+        private func schedulePendingTextApply(to textView: UITextView) {
+            pendingApplyTask?.cancel()
+            let delayMilliseconds = max(0, Int(ceil(deferIncomingTextUntil.timeIntervalSinceNow * 1_000)))
+            pendingApplyTask = Task { [weak self, weak textView] in
+                if delayMilliseconds > 0 {
+                    try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+                }
+
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self, let textView else { return }
+                    self.applyPendingTextIfIdle(to: textView)
+                }
+            }
+        }
+
+        private func applyPendingTextIfIdle(to textView: UITextView) {
+            guard !isUserInteracting(with: textView), Date() >= deferIncomingTextUntil else {
+                schedulePendingTextApply(to: textView)
+                return
+            }
+
+            guard let pendingText else { return }
+            applyText(pendingText, to: textView)
+        }
+
+        private func setUserScrolling(_ scrolling: Bool) {
+            guard isTrackingUserScroll != scrolling else { return }
+            isTrackingUserScroll = scrolling
+            isUserScrolling?.wrappedValue = scrolling
+        }
+
+        private func maxDate(_ lhs: Date, _ rhs: Date) -> Date {
+            lhs >= rhs ? lhs : rhs
+        }
+    }
+}
+
+private struct TerminalLogTextAnchor {
+    let line: String
+    let characterOffset: Int
+}
+
+private extension Character {
+    var isLogSeparator: Bool {
+        "-─━═—–_=".contains(self)
+    }
+}
+
+private extension String {
+    func trimmingTrailingWhitespaceAndNewlines() -> String {
+        var result = self
+        while let last = result.unicodeScalars.last,
+              CharacterSet.whitespacesAndNewlines.contains(last) {
+            result.removeLast()
+        }
+        return result
+    }
+}
+
+private struct LongContextView: View {
+    let pane: Pane
+
+    @Environment(MonitorStore.self) private var store
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var selectedLineCount = 1200
+    @State private var contextText = ""
+    @State private var capturedAt: Date?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    private let lineCountOptions = [300, 1200, 3000]
+
+    var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(statusColor(pane.status))
-                        .frame(width: 7, height: 7)
-                    Text("latest")
+            HStack(spacing: 10) {
+                Picker("Lines", selection: $selectedLineCount) {
+                    ForEach(lineCountOptions, id: \.self) { count in
+                        Text("\(count)").tag(count)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Button {
+                    Task { await loadContext() }
+                } label: {
+                    if isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 32, height: 32)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .frame(width: 32, height: 32)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isLoading)
+                .accessibilityLabel("Refresh context")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            HStack(spacing: 8) {
+                Text("\(selectedLineCount) lines")
+                if let capturedAt {
+                    Text("·")
+                    Text(capturedAt, style: .relative)
+                }
+                Spacer()
+                Button {
+                    copyContext()
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .disabled(contextText.isEmpty)
+            }
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 8)
+
+            ZStack(alignment: .topLeading) {
+                TerminalLogTextView(
+                    text: contextText,
+                    deferUpdatesWhileAwayFromTail: false,
+                    followTailRequest: 0,
+                    isUserScrolling: .constant(false),
+                    isFollowingTail: .constant(true)
+                )
+
+                if isLoading && contextText.isEmpty {
+                    ProgressView("Loading context...")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .padding(14)
+                } else if let errorMessage {
+                    Text(errorMessage)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.red)
+                        .padding(14)
+                } else if contextText.isEmpty {
+                    Text("No context captured.")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.46))
+                        .padding(14)
+                }
+            }
+            .background(Color.black)
+        }
+        .background(AgentMonitorTheme.backgroundGradient(for: colorScheme))
+        .task {
+            await loadContext()
+        }
+        .onChange(of: selectedLineCount) { _, _ in
+            Task { await loadContext() }
+        }
+    }
+
+    private func loadContext() async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        do {
+            let response = try await store.loadPaneContext(pane, lines: selectedLineCount)
+            contextText = response.tail
+            capturedAt = response.capturedAt
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    private func copyContext() {
+        UIPasteboard.general.string = contextText
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+}
+
+private extension UITextView {
+	    var isNearBottom: Bool {
+	        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
+	        guard visibleHeight > 0 else { return true }
+	        let maxOffsetY = max(-adjustedContentInset.top, contentSize.height - visibleHeight + adjustedContentInset.bottom)
+	        return contentOffset.y >= maxOffsetY - 96
+	    }
+
+    var isAtBottom: Bool {
+        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
+        guard visibleHeight > 0 else { return true }
+        let maxOffsetY = max(-adjustedContentInset.top, contentSize.height - visibleHeight + adjustedContentInset.bottom)
+        return contentOffset.y >= maxOffsetY - 4
+    }
+
+    func scrollToBottom(animated: Bool) {
+        layoutIfNeeded()
+        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
+        let maxOffsetY = max(-adjustedContentInset.top, contentSize.height - visibleHeight + adjustedContentInset.bottom)
+        setContentOffset(CGPoint(x: 0, y: maxOffsetY), animated: animated)
+    }
+
+    func restoreContentOffset(_ offset: CGPoint) {
+        layoutIfNeeded()
+        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
+        let maxOffsetY = max(-adjustedContentInset.top, contentSize.height - visibleHeight + adjustedContentInset.bottom)
+        let y = min(max(offset.y, -adjustedContentInset.top), maxOffsetY)
+        setContentOffset(CGPoint(x: offset.x, y: y), animated: false)
+    }
+
+    func restoreContentAnchor(_ offset: CGPoint, previousContentHeight: CGFloat) {
+        layoutIfNeeded()
+        let heightDelta = contentSize.height - previousContentHeight
+        restoreContentOffset(CGPoint(x: offset.x, y: offset.y + max(heightDelta, 0)))
+    }
+
+    func visibleTextAnchor() -> TerminalLogTextAnchor? {
+        layoutIfNeeded()
+        let point = CGPoint(x: textContainerInset.left + 2, y: contentOffset.y + adjustedContentInset.top + textContainerInset.top + 2)
+        let glyphIndex = layoutManager.glyphIndex(for: point, in: textContainer)
+        let characterIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        guard characterIndex < textStorage.length else { return nil }
+
+        let fullText = textStorage.string as NSString
+        let lineRange = fullText.lineRange(for: NSRange(location: characterIndex, length: 0))
+        let line = fullText.substring(with: lineRange).trimmingCharacters(in: .whitespacesAndNewlines)
+        return line.isEmpty ? nil : TerminalLogTextAnchor(line: line, characterOffset: lineRange.location)
+    }
+
+    func restoreVisibleTextAnchor(_ anchor: TerminalLogTextAnchor) {
+        layoutIfNeeded()
+        let fullText = textStorage.string as NSString
+        let range = rangeForVisibleAnchor(anchor, in: fullText)
+        guard range.location != NSNotFound else { return }
+
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: range.location, length: 0), actualCharacterRange: nil)
+        let rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        let y = rect.origin.y - adjustedContentInset.top - textContainerInset.top - 2
+        restoreContentOffset(CGPoint(x: contentOffset.x, y: y))
+    }
+
+    private func rangeForVisibleAnchor(_ anchor: TerminalLogTextAnchor, in fullText: NSString) -> NSRange {
+        guard fullText.length > 0 else {
+            return NSRange(location: NSNotFound, length: 0)
+        }
+
+        let preferredLocation = min(max(anchor.characterOffset, 0), fullText.length - 1)
+        let nearbyStart = max(0, preferredLocation - 20_000)
+        let nearbyEnd = min(fullText.length, preferredLocation + 20_000)
+        let nearbyRange = NSRange(location: nearbyStart, length: nearbyEnd - nearbyStart)
+        let nearbyMatch = fullText.range(of: anchor.line, options: [], range: nearbyRange)
+        if nearbyMatch.location != NSNotFound {
+            return nearbyMatch
+        }
+
+        return fullText.range(of: anchor.line, options: [], range: NSRange(location: 0, length: fullText.length))
+    }
+}
+
+private struct PaneActionIdentity: Equatable {
+    let id: String
+    let session: String
+    let command: String
+    let title: String
+}
+
+private extension Pane {
+    var identityForActions: PaneActionIdentity {
+        PaneActionIdentity(id: id, session: session, command: command, title: title)
+    }
+}
+
+private enum LogText {
+    static func compact(_ tail: String, limit: Int) -> String {
+        var lines: [String] = []
+        var previousWasBlank = false
+        var skipPermissionContinuation = false
+
+        for rawLine in tail.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard let line = normalize(String(rawLine), skipPermissionContinuation: &skipPermissionContinuation) else {
+                continue
+            }
+
+            if line.isEmpty {
+                if !previousWasBlank && !lines.isEmpty {
+                    lines.append("")
+                    previousWasBlank = true
+                }
+                continue
+            }
+
+            previousWasBlank = false
+            if lines.last != line {
+                lines.append(line)
+            }
+        }
+
+        return lines.suffix(limit).joined(separator: "\n").trimmingTrailingWhitespaceAndNewlines()
+    }
+
+    static func looksNewer(_ candidate: String, than current: String) -> Bool {
+        guard candidate != current else { return false }
+        guard !candidate.isEmpty else { return false }
+        if current.isEmpty { return true }
+        if candidate.hasPrefix(current) {
+            return true
+        }
+        if current.contains(candidate) {
+            return false
+        }
+        if candidate.contains(current) {
+            return !candidate.hasSuffix(current)
+        }
+
+        let currentTail = comparableTail(from: current)
+        let candidateTail = comparableTail(from: candidate)
+        if !currentTail.isEmpty, candidate.contains(currentTail) {
+            return !candidate.hasSuffix(currentTail)
+        }
+        if !candidateTail.isEmpty, current.contains(candidateTail) {
+            return false
+        }
+
+        return candidate.count >= current.count
+    }
+
+    static func looksOlder(_ candidate: String, than current: String) -> Bool {
+        guard candidate != current else { return false }
+        guard !candidate.isEmpty, !current.isEmpty else { return false }
+        if current.hasPrefix(candidate) || current.contains(candidate) {
+            return true
+        }
+
+        let candidateTail = comparableTail(from: candidate)
+        return !candidateTail.isEmpty && current.contains(candidateTail)
+    }
+
+    static func lineCount(_ text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return text.split(separator: "\n", omittingEmptySubsequences: false).count
+    }
+
+    static func mergedWindow(current: String, incoming: String, limit: Int) -> String {
+        guard !current.isEmpty, !incoming.isEmpty else { return incoming.isEmpty ? current : incoming }
+        if current == incoming || current.contains(incoming) {
+            return current
+        }
+        if incoming.contains(current) || incoming.hasPrefix(current) {
+            return incoming
+        }
+
+        let currentLines = current.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let incomingLines = incoming.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let overlap = suffixPrefixOverlap(currentLines, incomingLines)
+        guard overlap > 0 else { return incoming }
+
+        return (currentLines + incomingLines.dropFirst(overlap))
+            .suffix(limit)
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func clean(_ line: String) -> String {
+        let value = line
+            .replacingOccurrences(of: #"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\r", with: "")
+            .trimmingTrailingWhitespaceAndNewlines()
+
+        var promptValue = value.trimmingCharacters(in: .whitespaces)
+        while let first = promptValue.first,
+              "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(first) {
+            promptValue.removeFirst()
+            promptValue = promptValue.trimmingCharacters(in: .whitespaces)
+        }
+
+        if promptValue == "›" || promptValue == "❯" {
+            return ""
+        }
+        if promptValue.hasPrefix("›") || promptValue.hasPrefix("❯") {
+            promptValue.removeFirst()
+            return promptValue.trimmingCharacters(in: .whitespaces)
+        }
+
+        return value
+    }
+
+    private static func normalize(_ line: String, skipPermissionContinuation: inout Bool) -> String? {
+        var value = clean(line)
+
+        if skipPermissionContinuation {
+            let lower = value.trimmingCharacters(in: .whitespaces).lowercased()
+            skipPermissionContinuation = false
+            if lower == "to cycle)" || lower.contains("shift+tab") || lower.contains("bypass permissions") {
+                return nil
+            }
+        }
+
+        let lower = value.trimmingCharacters(in: .whitespaces).lowercased()
+        if lower.hasPrefix("-- insert") ||
+            lower.hasPrefix("-- normal") ||
+            lower.hasPrefix("-- visual") ||
+            lower.hasPrefix("-- replace") {
+            skipPermissionContinuation = lower.contains("shift+tab") ||
+                lower.contains("to cycle") ||
+                lower.contains("bypass permissions")
+            return nil
+        }
+        if lower.contains("bypass permissions") && lower.contains("shift+tab") {
+            return nil
+        }
+
+        guard let normalized = normalizeSeparatorLine(value) else {
+            return nil
+        }
+        value = normalized
+
+        return value
+    }
+
+    private static func normalizeSeparatorLine(_ line: String) -> String? {
+        guard !isSeparatorOnly(line) else { return nil }
+
+        let value = removeTrailingSeparatorRun(
+            from: removeLeadingSeparatorRun(from: line)
+        ).trimmingTrailingWhitespaceAndNewlines()
+
+        return value.isEmpty ? nil : value
+    }
+
+    private static func isSeparatorOnly(_ line: String) -> Bool {
+        line.allSatisfy { character in
+            character.isLogSeparator ||
+                character.unicodeScalars.allSatisfy { CharacterSet.whitespacesAndNewlines.contains($0) }
+        }
+    }
+
+    private static func removeLeadingSeparatorRun(from line: String) -> String {
+        var index = line.startIndex
+        var separatorCount = 0
+
+        while index < line.endIndex {
+            let character = line[index]
+            if character.unicodeScalars.allSatisfy({ CharacterSet.whitespaces.contains($0) }) {
+                line.formIndex(after: &index)
+                continue
+            }
+            guard character.isLogSeparator else { break }
+            separatorCount += 1
+            line.formIndex(after: &index)
+        }
+
+        guard separatorCount >= 8 else { return line }
+        return String(line[index...]).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func removeTrailingSeparatorRun(from line: String) -> String {
+        var index = line.endIndex
+        var separatorCount = 0
+
+        while index > line.startIndex {
+            let previous = line.index(before: index)
+            let character = line[previous]
+            if character.unicodeScalars.allSatisfy({ CharacterSet.whitespaces.contains($0) }) {
+                index = previous
+                continue
+            }
+            guard character.isLogSeparator else { break }
+            separatorCount += 1
+            index = previous
+        }
+
+        guard separatorCount >= 8 else { return line }
+        return String(line[..<index]).trimmingTrailingWhitespaceAndNewlines()
+    }
+
+    private static func comparableTail(from text: String) -> String {
+        text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .suffix(24)
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func suffixPrefixOverlap(_ currentLines: [String], _ incomingLines: [String]) -> Int {
+        let maxOverlap = min(currentLines.count, incomingLines.count)
+        guard maxOverlap > 0 else { return 0 }
+
+        for count in stride(from: maxOverlap, through: 1, by: -1) {
+            if currentLines.suffix(count).elementsEqual(incomingLines.prefix(count)) {
+                return count
+            }
+        }
+
+        return 0
+    }
+}
+
+// MARK: - Agent Overview
+
+private struct AgentOverviewPanel: View {
+    let session: String
+    let status: PaneStatus
+    let title: String
+    let reason: String
+    let tail: String
+    let updatedAt: Date
+    let interpretedMessages: [InteractionMessage]
+    let isLiveServer: Bool
+
+    init(
+        session: String,
+        status: PaneStatus,
+        title: String,
+        reason: String,
+        tail: String,
+        updatedAt: Date,
+        interpretedMessages: [InteractionMessage] = [],
+        isLiveServer: Bool = true
+    ) {
+        self.session = session
+        self.status = status
+        self.title = title
+        self.reason = reason
+        self.tail = tail
+        self.updatedAt = updatedAt
+        self.interpretedMessages = interpretedMessages
+        self.isLiveServer = isLiveServer
+    }
+
+    private var cleanTitle: String {
+        cleanTaskTitle(title)
+    }
+
+    private var agentLabel: String {
+        if session.hasPrefix("cc_") { return "Claude Code" }
+        if session.hasPrefix("cx_") { return "Codex" }
+        return "Agent"
+    }
+
+    private var stateTitle: String {
+        switch status {
+        case .running: return "Working"
+        case .waiting: return "Needs your input"
+        case .idle: return "Idle"
+        case .failed: return "Something went wrong"
+        case .done: return "Completed"
+        }
+    }
+
+    private var summaryText: String {
+        if let message = interpretedMessages.first(where: { $0.kind == .summary }),
+           !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return message.body
+        }
+        return LocalSummary.recentWork(from: tail)
+    }
+
+    private var currentStateText: String {
+        if let message = interpretedMessages.first(where: { $0.kind != .summary && $0.kind != .notification }),
+           !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return message.body
+        }
+        return LocalSummary.currentState(status: status, title: cleanTitle, reason: reason, tail: tail)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 14) {
+                AgentAvatar(session: session, size: 52)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(agentLabel)
+                        .font(.system(size: 17, weight: .semibold))
+
+                    if !cleanTitle.isEmpty {
+                        Text(cleanTitle)
+                            .font(.system(size: 14))
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                    }
                 }
 
                 Spacer()
 
-                Text(pane.updatedAt, style: .time)
+                StatusPill(status: status, title: stateTitle)
             }
-            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-            .foregroundStyle(.green.opacity(0.9))
-            .textCase(.uppercase)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(Color(red: 0.03, green: 0.04, blue: 0.03))
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(output)
-                            .font(.system(size: 12, weight: .regular, design: .monospaced))
-                            .lineSpacing(3)
-                            .foregroundStyle(Color(red: 0.86, green: 0.90, blue: 0.82))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Color.clear
-                            .frame(height: 1)
-                            .id("tail-bottom")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Recent work")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .textCase(.uppercase)
+
+                Text(summaryText)
+                    .font(.system(size: 15))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            HStack(alignment: .top, spacing: 12) {
+                statusIcon
+                    .frame(width: 30, height: 30)
+                    .padding(.top, 1)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text("Current state")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .textCase(.uppercase)
+
+                        Text(updatedAt, style: .relative)
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
                     }
-                    .padding(12)
+
+                    Text(currentStateText)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(red: 0.02, green: 0.025, blue: 0.02))
-                .onAppear {
-                    proxy.scrollTo("tail-bottom", anchor: .bottom)
-                }
-                .onChange(of: pane.tail) { _, _ in
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo("tail-bottom", anchor: .bottom)
-                    }
-                }
+            }
+            .padding(14)
+            .background(statusColor(status).opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            if !isLiveServer {
+                Label("Actions and live terminal are available after switching to this server.", systemImage: "lock.fill")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .padding(.top, -2)
             }
         }
+        .padding(16)
+        .background(Color(.systemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.green.opacity(0.22), lineWidth: 1)
-        )
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        switch status {
+        case .running:
+            ProgressView()
+                .controlSize(.regular)
+        case .waiting:
+            Image(systemName: "questionmark.circle.fill")
+                .font(.system(size: 28))
+                .foregroundColor(.yellow)
+        case .idle:
+            Image(systemName: "moon.fill")
+                .font(.system(size: 24))
+                .foregroundColor(.gray)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 26))
+                .foregroundColor(.red)
+        case .done:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 28))
+                .foregroundColor(.blue)
+        }
     }
 }
 
-private struct QuickReplyComposer: View {
-    let pane: Pane
-    @Binding var inputText: String
-    @Binding var vimMode: Bool
-    var composerFocused: FocusState<Bool>.Binding
-    @Binding var showKillConfirmation: Bool
-
-    @Environment(MonitorStore.self) private var store
-
-    private let quickMessages = ["继续", "yes", "no", "done", "LGTM"]
-    private let quickKeys = [
-        ("Enter", "Enter"),
-        ("Esc", "C-["),
-        ("Ctrl-C", "C-c")
-    ]
+private struct StatusPill: View {
+    let status: PaneStatus
+    let title: String
 
     var body: some View {
-        VStack(spacing: 10) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(quickMessages, id: \.self) { message in
-                        Button(message) {
-                            Task { await store.sendText(message, to: pane, vimMode: vimMode) }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    Divider()
-                        .frame(height: 24)
-
-                    ForEach(quickKeys, id: \.0) { title, key in
-                        Button(title) {
-                            Task { await store.sendKey(key, to: pane) }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    Button(role: .destructive) {
-                        showKillConfirmation = true
-                    } label: {
-                        Image(systemName: "xmark.octagon")
-                    }
-                    .buttonStyle(.bordered)
-                }
-            }
-
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Type a quick reply", text: $inputText, axis: .vertical)
-                    .lineLimit(1...4)
-                    .textFieldStyle(.plain)
-                    .focused(composerFocused)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-                Button {
-                    sendCurrentText()
-                } label: {
-                    Image(systemName: "paperplane.fill")
-                        .font(.headline)
-                        .frame(width: 42, height: 42)
-                }
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.circle)
-                .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-
-            Toggle("Vim mode", isOn: $vimMode)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .toggleStyle(.switch)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(spacing: 6) {
+            Circle()
+                .fill(statusColor(status))
+                .frame(width: 7, height: 7)
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(statusColor(status))
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)
-        .padding(.bottom, 12)
-        .background(.thinMaterial)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(statusColor(status).opacity(0.12))
+        .clipShape(Capsule())
+    }
+}
+
+// MARK: - Feedback Timeline
+
+private struct UserInteractionMessage: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+    let sentAt: Date
+}
+
+private struct FeedbackTimeline: View {
+    let session: String
+    let status: PaneStatus
+    let title: String
+    let reason: String
+    let tail: String
+    let updatedAt: Date
+    let interpretedMessages: [InteractionMessage]
+    let userMessages: [UserInteractionMessage]
+
+    private var cleanTitle: String {
+        cleanTaskTitle(title)
+    }
+
+    private var feedbackMessages: [InteractionMessage] {
+        let messages = interpretedMessages.filter { $0.kind == .notification || $0.priority == .high }
+        if !messages.isEmpty {
+            return messages
+        }
+        return [
+            InteractionMessage(
+                id: "fallback-feedback-\(status.rawValue)",
+                paneId: "",
+                role: .agent,
+                kind: .notification,
+                priority: status == .waiting || status == .failed ? .high : .normal,
+                title: LocalSummary.feedbackTitle(status: status),
+                body: LocalSummary.feedback(status: status, title: cleanTitle, reason: reason, tail: tail),
+                actions: nil,
+                source: nil,
+                createdAt: updatedAt
+            )
+        ]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Feedback")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.secondary)
+                .textCase(.uppercase)
+
+            if status == .running || status == .waiting {
+                LiveActivityPanel(lines: LocalSummary.liveActivity(from: tail))
+            }
+
+            ForEach(feedbackMessages) { message in
+                AgentMessageBubble(
+                    session: session,
+                    status: status,
+                    kind: message.kind,
+                    title: message.title,
+                    message: message.body,
+                    updatedAt: message.createdAt,
+                    actions: message.actions,
+                    onOpenTerminal: {},
+                    onOpenLongContext: {},
+                    onSendAction: { _ in false }
+                )
+            }
+
+            ForEach(userMessages) { message in
+                UserMessageBubble(message: message)
+            }
+        }
+    }
+}
+
+private struct LiveActivityPanel: View {
+    let lines: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Live activity")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .textCase(.uppercase)
+            }
+
+            if lines.isEmpty {
+                Text("Waiting for the next visible checkpoint...")
+                    .font(.system(size: 14))
+                    .foregroundColor(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(lines, id: \.self) { line in
+                        Text(line)
+                            .font(.system(size: 14))
+                            .foregroundColor(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+}
+
+private struct AgentMessageBubble: View {
+    let session: String
+    let status: PaneStatus
+    let kind: InteractionMessageKind?
+    let title: String?
+    let message: String
+    let updatedAt: Date
+    var actions: [InteractionAction]?
+    var actionsEnabled = true
+    var onOpenTerminal: () -> Void
+    var onOpenLongContext: () -> Void
+    var onSendAction: (String) async -> Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            AgentAvatar(session: session, size: 36)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(tint)
+                        .frame(width: 7, height: 7)
+                    Text(title?.isEmpty == false ? title! : status.title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(tint)
+                    Text(updatedAt, style: .relative)
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+
+                Text(message)
+                    .font(.system(size: 15))
+                    .foregroundColor(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let actions, !actions.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(actions, id: \.payload) { action in
+                                Button {
+                                    perform(action)
+                                } label: {
+                                    Text(action.label)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(action.style == .destructive ? .red : .accentColor)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color(.tertiarySystemFill), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(!actionsEnabled)
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            Spacer(minLength: 28)
+        }
+    }
+
+    private var tint: Color {
+        kind == .summary ? .secondary : statusColor(status)
+    }
+
+    private func perform(_ action: InteractionAction) {
+        guard actionsEnabled else {
+            Haptics.sent(success: false)
+            return
+        }
+        switch action.payload {
+        case "open_terminal":
+            onOpenTerminal()
+            Haptics.sent(success: true)
+        case "open_long_context":
+            onOpenLongContext()
+            Haptics.sent(success: true)
+        default:
+            Task {
+                let sent = await onSendAction(action.payload)
+                await MainActor.run {
+                    Haptics.sent(success: sent)
+                }
+            }
+        }
+    }
+}
+
+private struct UserMessageBubble: View {
+    let message: UserInteractionMessage
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            Spacer(minLength: 44)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                Text(message.text)
+                    .font(.system(size: 15))
+                    .foregroundColor(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(message.sentAt, style: .time)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.72))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.accentColor)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+    }
+}
+
+private enum AgentPromptText {
+    static func extract(from tail: String) -> String {
+        let lines = tail.split(separator: "\n", omittingEmptySubsequences: true)
+        for line in lines.reversed() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if isMeaningfulLine(trimmed) {
+                return String(trimmed)
+            }
+        }
+        return ""
+    }
+
+    static func isMeaningfulLine(_ line: String) -> Bool {
+        if line.isEmpty { return false }
+        if line.allSatisfy({ "─━═— ".contains($0) }) { return false }
+        if line.hasPrefix("--") { return false }
+        if line.first.map({ (0x2800...0x28FF).contains($0.unicodeScalars.first?.value ?? 0) }) == true { return false }
+        return true
+    }
+}
+
+private enum LocalSummary {
+    static func liveActivity(from tail: String) -> [String] {
+        meaningfulLines(from: tail, limit: 5)
+            .map(shortLine)
+    }
+
+    static func recentWork(from tail: String) -> String {
+        let keywordLines = meaningfulLines(from: tail, limit: 32)
+            .filter { line in
+                let lower = line.lowercased()
+                return [
+                    "succeeded", "passed", "finished", "completed", "done", "fixed",
+                    "updated", "created", "generated", "built", "compiled", "checked",
+                    "installed", "launched", "failed", "error"
+                ].contains { lower.contains($0) }
+            }
+            .suffix(4)
+            .map(shortLine)
+
+        let lines = keywordLines.isEmpty
+            ? meaningfulLines(from: tail, limit: 4).suffix(4).map(shortLine)
+            : keywordLines
+
+        if lines.isEmpty {
+            return "No recent work has been captured yet."
+        }
+
+        return lines.map { "- \($0)" }.joined(separator: "\n")
+    }
+
+    static func currentState(status: PaneStatus, title: String, reason: String, tail: String) -> String {
+        switch status {
+        case .running:
+            return title.isEmpty ? (reason.isEmpty ? "Working on the current task." : reason) : "Working on \(title)."
+        case .waiting:
+            let prompt = AgentPromptText.extract(from: tail)
+            return prompt.isEmpty ? "Waiting for your input before it can continue." : prompt
+        case .idle:
+            return reason.isEmpty ? "Idle and ready for a new instruction." : reason
+        case .failed:
+            return reason.isEmpty ? "The last phase needs attention." : reason
+        case .done:
+            return reason.isEmpty ? "Recent work is complete." : reason
+        }
+    }
+
+    static func feedbackTitle(status: PaneStatus) -> String {
+        switch status {
+        case .running: "Phase feedback"
+        case .waiting: "Blocked"
+        case .idle: "Ready"
+        case .failed: "Needs follow-up"
+        case .done: "Ready for next instruction"
+        }
+    }
+
+    static func feedback(status: PaneStatus, title: String, reason: String, tail: String) -> String {
+        switch status {
+        case .running:
+            let latest = meaningfulLines(from: tail, limit: 1).last
+            return latest.map { "Latest checkpoint: \($0)" }
+                ?? "The agent is still working. Feedback will update when the next checkpoint appears."
+        case .waiting:
+            return "The agent is waiting for your reply before it can continue."
+        case .idle:
+            return "No active work is running. Send a new instruction below when you want the agent to continue."
+        case .failed:
+            return reason.isEmpty ? "The last phase needs attention before work can continue." : reason
+        case .done:
+            return "Recent work appears complete. You can send a follow-up instruction below."
+        }
+    }
+
+    private static func meaningfulLines(from tail: String, limit: Int) -> [String] {
+        var lines: [String] = []
+        for rawLine in tail.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = cleanDisplayLine(String(rawLine))
+                .replacingOccurrences(of: #"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard AgentPromptText.isMeaningfulLine(line) else { continue }
+            if lines.last != line {
+                lines.append(line)
+            }
+        }
+        return Array(lines.suffix(limit))
+    }
+
+    private static func cleanDisplayLine(_ line: String) -> String {
+        var value = line
+            .replacingOccurrences(of: #"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while let first = value.first,
+              "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(first) {
+            value.removeFirst()
+            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if value.hasPrefix("›") || value.hasPrefix("❯") {
+            value.removeFirst()
+            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value
+    }
+
+    private static func shortLine(_ line: String) -> String {
+        if line.count <= 150 { return line }
+        return String(line.prefix(147)) + "..."
+    }
+}
+
+private func cleanTaskTitle(_ value: String) -> String {
+    var title = value
+    while let first = title.unicodeScalars.first,
+          (0x2800...0x28FF).contains(first.value) || first.value == 0x2733 || first == " " {
+        title = String(title.unicodeScalars.dropFirst())
+    }
+    return title.trimmingCharacters(in: .whitespaces)
+}
+
+// MARK: - Agent Prompt Card (Info Sheet)
+
+private struct AgentPromptCard: View {
+    let tail: String
+
+    private var promptText: String {
+        AgentPromptText.extract(from: tail).isEmpty ? "Waiting for input..." : AgentPromptText.extract(from: tail)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Agent is asking", systemImage: "bubble.left.fill")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(.yellow.opacity(0.9))
+
+            Text(promptText)
+                .font(.system(size: 14))
+                .foregroundColor(.primary)
+                .lineLimit(5)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color.yellow.opacity(0.08))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.yellow.opacity(0.2), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - Last Output Card (collapsed)
+
+private struct LastOutputCard: View {
+    let tail: String
+    let isTerminalAvailable: Bool
+    let onOpenTerminal: () -> Void
+
+    private var lastLines: String {
+        let lines = tail
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                !line.isEmpty &&
+                !line.allSatisfy { "─━═— ".contains($0) } &&
+                !line.hasPrefix("-- INSERT") &&
+                !line.hasPrefix("-- NORMAL") &&
+                !(line.first.map { (0x2800...0x28FF).contains($0.unicodeScalars.first?.value ?? 0) } ?? false)
+            }
+        return lines.suffix(3).joined(separator: "\n")
+    }
+
+    var body: some View {
+        Button {
+            guard isTerminalAvailable else {
+                Haptics.sent(success: false)
+                return
+            }
+            onOpenTerminal()
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("Recent Output", systemImage: "text.alignleft")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Text(isTerminalAvailable ? "Full Terminal" : "Switch server")
+                            .font(.system(size: 12))
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10))
+                    }
+                    .foregroundColor(isTerminalAvailable ? .accentColor : .secondary)
+                }
+
+                if lastLines.isEmpty {
+                    Text("No output yet")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                } else {
+                    Text(lastLines)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(14)
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(!isTerminalAvailable)
+    }
+}
+
+// MARK: - Input Bar
+
+private struct InputBar: View {
+    let pane: Pane
+    @Environment(AppSettings.self) private var settings
+    @Environment(BackgroundAudioKeepAlive.self) private var backgroundAudio
+    @Binding var inputText: String
+    @Binding var vimMode: Bool
+    @Binding var showKillConfirmation: Bool
+    let onSendText: (String) async -> Bool
+    let onUserMessageSent: (String) -> Void
+    let onRefineText: (String) async -> String
+    let onSendKey: (String) async -> Bool
+    let onUploadImage: (Data) async throws -> UploadedImageResponse
+    @State private var voiceInput = VoiceInputController()
+    @State private var voiceRuntime = VoiceInputRuntimeState()
+    @State private var voiceDisplayState = VoiceDisplayState()
+    @State private var voiceOverlayRuntime = VoiceRecordingOverlayRuntime()
+    @State private var isCancelingVoice = false
+    @State private var isFinalizingVoice = false
+    @State private var isVoicePressing = false
+    @State private var inputMode: ComposerInputMode = .voice
+    @State private var composerTextHeight: CGFloat = 22
+    @State private var floatingDraftTextHeight: CGFloat = 44
+    @State private var shouldRefineBeforeSend = false
+    @State private var isGoalModeEnabled = false
+    @State private var isRefiningText = false
+    @State private var isSendingText = false
+    @State private var selectedImageItem: PhotosPickerItem?
+    @State private var isUploadingImage = false
+    @State private var imageFeedback: ImageSendFeedback?
+    @State private var isShowingDraftEditor = false
+    @State private var voicePrepareTask: Task<Void, Never>?
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var voiceStatusMessage: String? {
+        if let message = voiceDisplayState.errorMessage {
+            return message
+        }
+        if isCancelingVoice {
+            return "松手取消本次语音"
+        }
+        if isFinalizingVoice {
+            return "正在收尾，等待最后的识别结果..."
+        }
+        return voiceDisplayState.statusText
+    }
+
+    private var isShowingVoiceHoldPanel: Bool {
+        inputMode == .voice && (isVoicePressing || voiceDisplayState.isActive || isFinalizingVoice)
+    }
+
+    private var isShowingFloatingTextDraft: Bool {
+        inputMode == .voice &&
+            !isShowingVoiceHoldPanel &&
+            !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var quickMessages: [String] {
+        settings.visibleQuickActionButtons
+    }
+
+    private let quickKeys: [(String, String)] = [
+        ("Enter", "Enter"),
+        ("Esc", "C-["),
+        ("C-c", "C-c")
+    ]
+
+    private var isLongDraft: Bool {
+        inputText.count > 120 || inputText.filter(\.isNewline).count >= 2
+    }
+
+    private var composerMaxLines: Int {
+        isLongDraft ? 10 : 4
+    }
+
+    private var floatingDraftMaxLines: Int {
+        isLongDraft ? 12 : 8
+    }
+
+    private var canSendText: Bool {
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isInputBusy
+    }
+
+    private var isTextSendBusy: Bool {
+        isRefiningText || isSendingText
+    }
+
+    private var isInputBusy: Bool {
+        isTextSendBusy || isUploadingImage
+    }
+
+    private var isShowingBottomInteractionPanel: Bool {
+        isShowingVoiceHoldPanel || isShowingFloatingTextDraft
+    }
+
+    private var isVoiceInteractionActive: Bool {
+        isVoicePressing || voiceDisplayState.isActive || isFinalizingVoice
+    }
+
+    var body: some View {
+        normalInputStack
+            .allowsHitTesting(!isShowingBottomInteractionPanel || isShowingVoiceHoldPanel)
+            .overlay(alignment: .bottom) {
+                bottomInteractionPanel
+            }
+	        .frame(maxWidth: .infinity)
+	        .animation(.agentThemeChange, value: colorScheme)
+        .onDisappear {
+            voicePrepareTask?.cancel()
+            voicePrepareTask = nil
+            isVoicePressing = false
+            voiceDisplayState.detach(from: voiceInput)
+            voiceOverlayRuntime.hide()
+            voiceRuntime.reset()
+            voiceRuntime.isPressing = false
+            isCancelingVoice = false
+            isFinalizingVoice = false
+            inputMode = .voice
+            voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: false)
+        }
+        .onAppear {
+            Haptics.prepareVoicePress()
+            voiceDisplayState.attach(to: voiceInput)
+            prepareVoiceInputIfIdle(force: true)
+        }
+        .onChange(of: voiceDisplayState.phase) { _, _ in
+            syncVoiceOverlayRuntimeFromState()
+        }
+        .onChange(of: selectedImageItem) { _, item in
+            guard let item else { return }
+            Task {
+                await sendSelectedImage(item)
+                selectedImageItem = nil
+            }
+        }
+        .sheet(isPresented: $isShowingDraftEditor) {
+            DraftEditorSheet(
+                text: $inputText,
+                isSending: isInputBusy,
+                onSend: {
+                    isShowingDraftEditor = false
+                    sendCurrentText()
+                }
+            )
+        }
+    }
+
+    private var normalInputStack: some View {
+        VStack(spacing: 10) {
+            accessoryActionTray
+
+            composerSurface
+
+            if let message = voiceStatusMessage, !isShowingVoiceHoldPanel {
+                Label(message, systemImage: voiceDisplayState.errorMessage == nil ? "waveform" : "exclamationmark.triangle.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(voiceDisplayState.errorMessage == nil ? .secondary : .red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+            }
+
+            if let feedback = imageFeedback {
+                Label(feedback.message, systemImage: feedback.systemImage)
+                    .font(.system(size: 12))
+                    .foregroundColor(feedback.tint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+    }
+
+    @ViewBuilder
+    private var bottomInteractionPanel: some View {
+        ZStack(alignment: .bottom) {
+            VoiceRecordingOverlay(
+                isVisible: inputMode == .voice && isShowingVoiceHoldPanel,
+                isCanceling: isCancelingVoice,
+                isFinalizing: isFinalizingVoice,
+                isStarting: isVoicePressing || voiceDisplayState.isStarting,
+                isListening: voiceDisplayState.isListening,
+                pageBackgroundColor: UIColor(AgentMonitorTheme.pageBackground(for: colorScheme)),
+                runtime: voiceOverlayRuntime,
+                voiceInput: voiceInput
+            )
+            .frame(height: 190)
+            .allowsHitTesting(false)
+
+            if isShowingFloatingTextDraft {
+                FloatingVoiceTextDraft(
+                    text: $inputText,
+                    measuredHeight: $floatingDraftTextHeight,
+                    maxLines: floatingDraftMaxLines,
+                    isSending: isInputBusy,
+                    onCancel: clearFloatingDraft,
+                    onSend: sendCurrentText
+                )
+                .transition(.opacity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var accessoryActionTray: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                goalModeButton
+
+                if pane.session.hasPrefix("cc_") {
+                    Button {
+                        vimMode.toggle()
+                    } label: {
+                        Text(vimMode ? "vim on" : "vim off")
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            .foregroundColor(vimMode ? .white : .secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(vimMode ? Color.accentColor : AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isInputBusy)
+                }
+
+                ForEach(quickMessages, id: \.self) { message in
+                    Button(message) {
+                        Task { await sendPresetText(message) }
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.82))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
+                    .buttonStyle(.plain)
+                    .disabled(isInputBusy)
+                }
+
+                ForEach(quickKeys, id: \.0) { title, key in
+                    Button(title) {
+                        Task { _ = await onSendKey(key) }
+                    }
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
+                    .buttonStyle(.plain)
+                    .disabled(isInputBusy)
+                }
+
+                Button(role: .destructive) {
+                    showKillConfirmation = true
+                } label: {
+                    Label("Close", systemImage: "xmark.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.plain)
+                .disabled(isInputBusy)
+            }
+            .padding(.horizontal, 18)
+        }
+    }
+
+    private var goalModeButton: some View {
+        Button {
+            toggleGoalMode()
+        } label: {
+            Label(isGoalModeEnabled ? "Goal on" : "Goal", systemImage: "target")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(isGoalModeEnabled ? .white : .secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    isGoalModeEnabled
+                        ? Color.accentColor
+                        : AgentMonitorTheme.softFill(for: colorScheme),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(isInputBusy)
+        .accessibilityLabel(isGoalModeEnabled ? "Disable goal mode" : "Enable goal mode")
+    }
+
+    @ViewBuilder
+    private var composerSurface: some View {
+        switch inputMode {
+        case .voice:
+            voiceComposerSurface
+        case .text:
+            textComposerSurface
+        }
+    }
+
+    private var voiceComposerSurface: some View {
+        HStack(spacing: 6) {
+            imagePickerButton(isUploading: isUploadingImage, isDisabled: isInputBusy || voiceDisplayState.isActive)
+
+            HoldToSpeakButton(
+                isActive: isVoiceInteractionActive,
+                isStarting: voiceDisplayState.isStarting || isVoicePressing,
+                isListening: voiceDisplayState.isListening,
+                isPressing: isVoicePressing,
+                isCanceling: isCancelingVoice,
+                isFinalizing: isFinalizingVoice,
+                onPressStart: { touchStartedAt in
+                    beginVoiceInput(touchStartedAt: touchStartedAt)
+                },
+                onPressEnd: endVoiceInput,
+                onCancelStateChange: updateVoiceCancelVisualState,
+                onEnterCancelZone: triggerCancelZoneHaptic,
+                onPressCancel: cancelVoiceInput
+            )
+            .disabled(isInputBusy)
+
+            Button {
+                toggleInputMode()
+            } label: {
+                ComposerIconLabel(systemImage: "keyboard", isLoading: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(isVoiceInteractionActive || isInputBusy)
+            .accessibilityLabel("Switch to keyboard input")
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 52)
+        .background(AgentMonitorTheme.elevatedSurface(for: colorScheme).opacity(0.92), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
+        )
+        .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 14 : 10, x: 0, y: 4)
+        .padding(.horizontal, 18)
+        .onAppear {
+            scheduleVoiceInputPrepare(force: true, after: .zero)
+        }
+    }
+
+    private var textComposerSurface: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            Button {
+                toggleInputMode()
+            } label: {
+                ComposerIconLabel(systemImage: "waveform.circle", isLoading: false)
+            }
+            .buttonStyle(.plain)
+            .disabled(isInputBusy)
+            .accessibilityLabel("Switch to voice input")
+
+            AutoScrollingComposerTextView(
+                text: $inputText,
+                measuredHeight: $composerTextHeight,
+                maxLines: composerMaxLines
+            )
+            .frame(height: composerTextHeight)
+            .padding(.horizontal, 2)
+            .padding(.vertical, 12)
+
+            if isLongDraft {
+                Button {
+                    isShowingDraftEditor = true
+                } label: {
+                    ComposerIconLabel(systemImage: "arrow.up.left.and.arrow.down.right", isLoading: false)
+                }
+                .buttonStyle(.plain)
+                .disabled(isInputBusy)
+                .accessibilityLabel("Review full draft")
+            }
+
+            imagePickerButton(isUploading: isUploadingImage, isDisabled: isInputBusy || voiceDisplayState.isActive)
+
+            Button {
+                sendCurrentText()
+            } label: {
+                ComposerIconLabel(systemImage: "arrow.up.circle.fill", isLoading: isTextSendBusy)
+                    .foregroundColor(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .gray.opacity(0.38) : .accentColor)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSendText)
+            .accessibilityLabel("Send message")
+        }
+        .padding(.horizontal, 8)
+        .frame(minHeight: 52)
+        .background(AgentMonitorTheme.elevatedSurface(for: colorScheme).opacity(0.92), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
+        )
+        .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 14 : 10, x: 0, y: 4)
+        .padding(.horizontal, 18)
+    }
+
+    private func imagePickerButton(isUploading: Bool, isDisabled: Bool) -> some View {
+        PhotosPicker(selection: $selectedImageItem, matching: .images, photoLibrary: .shared()) {
+            ComposerIconLabel(systemImage: "camera", isLoading: isUploading)
+        }
+        .disabled(isDisabled)
+        .accessibilityLabel("Choose image")
     }
 
     private func sendCurrentText() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        guard !isInputBusy else { return }
+        let needsRefinement = shouldRefineBeforeSend
+        let sendsAsGoal = isGoalModeEnabled
+        let restoreInputMode = inputMode
+        resetVoiceInteractionState(hideOverlay: true, keepTencentWarm: false)
+        inputMode = .voice
         inputText = ""
-        composerFocused.wrappedValue = false
-        Task { await store.sendText(text, to: pane, vimMode: vimMode) }
+        shouldRefineBeforeSend = false
+        isGoalModeEnabled = false
+        isSendingText = true
+        dismissKeyboard()
+        Task {
+            let textToSend: String
+            if needsRefinement {
+                await MainActor.run { isRefiningText = true }
+                textToSend = await onRefineText(text)
+                await MainActor.run { isRefiningText = false }
+            } else {
+                textToSend = text
+            }
+
+            let payload = sendsAsGoal ? goalModeText(for: textToSend) : textToSend
+            let sent = await onSendText(payload)
+            await MainActor.run {
+                isRefiningText = false
+                isSendingText = false
+                Haptics.sent(success: sent)
+                if !sent {
+                    inputText = textToSend
+                    shouldRefineBeforeSend = false
+                    isGoalModeEnabled = sendsAsGoal
+                    inputMode = restoreInputMode
+                } else {
+                    onUserMessageSent(textToSend)
+                    inputMode = .voice
+                    scheduleVoiceInputPrepare(after: .milliseconds(40))
+                }
+            }
+        }
+    }
+
+    private func clearFloatingDraft() {
+        resetVoiceInteractionState(hideOverlay: true)
+        inputText = ""
+        shouldRefineBeforeSend = false
+        isGoalModeEnabled = false
+        inputMode = .voice
+        dismissKeyboard()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func sendPresetText(_ text: String) async {
+        let shouldSend = await MainActor.run {
+            guard !isInputBusy else { return false }
+            isSendingText = true
+            return true
+        }
+        guard shouldSend else { return }
+        let sent = await onSendText(text)
+        await MainActor.run {
+            isSendingText = false
+            Haptics.sent(success: sent)
+            if sent {
+                onUserMessageSent(text)
+            }
+        }
+    }
+
+    private func sendSelectedImage(_ item: PhotosPickerItem) async {
+        guard !isInputBusy else { return }
+        isUploadingImage = true
+        setImageFeedback(.progress("正在读取图片..."))
+        defer { isUploadingImage = false }
+
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                setImageFeedback(.failure("无法读取这张图片"))
+                Haptics.sent(success: false)
+                return
+            }
+
+            setImageFeedback(.progress("正在压缩图片..."))
+            guard let jpegData = await Task.detached(priority: .userInitiated, operation: {
+                ImageUploadCompressor.compressedJPEGData(from: data)
+            }).value else {
+                setImageFeedback(.failure("图片压缩失败"))
+                Haptics.sent(success: false)
+                return
+            }
+
+            let sizeText = ByteCountFormatter.string(fromByteCount: Int64(jpegData.count), countStyle: .file)
+            setImageFeedback(.progress("正在上传压缩图片（\(sizeText)）..."))
+            let uploaded = try await onUploadImage(jpegData)
+            resetVoiceInteractionState(hideOverlay: true, keepTencentWarm: false)
+            inputMode = .text
+            inputText = mergedDraftText(base: inputText, addition: imagePrompt(for: uploaded.path))
+            shouldRefineBeforeSend = false
+            let feedback = ImageSendFeedback.success("图片已生成文字草稿，可编辑后发送（\(sizeText)）")
+            setImageFeedback(feedback)
+            hideImageFeedbackAfterDelay(feedback.id)
+            Haptics.sent(success: true)
+        } catch {
+            setImageFeedback(.failure("图片发送失败：\(error.localizedDescription)"))
+            Haptics.sent(success: false)
+        }
+    }
+
+    private func setImageFeedback(_ feedback: ImageSendFeedback?) {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            imageFeedback = feedback
+        }
+    }
+
+    private func hideImageFeedbackAfterDelay(_ id: UUID) {
+        Task {
+            try? await Task.sleep(for: .seconds(4))
+            await MainActor.run {
+                guard imageFeedback?.id == id else { return }
+                setImageFeedback(nil)
+            }
+        }
+    }
+
+    private func toggleInputMode() {
+        if inputMode == .text {
+            resetVoiceInteractionState(hideOverlay: true)
+            inputMode = .voice
+            dismissKeyboard()
+            prepareVoiceInputIfIdle(force: true)
+        } else {
+            resetVoiceInteractionState(hideOverlay: true, keepTencentWarm: false)
+            inputMode = .text
+        }
+    }
+
+    private func toggleGoalMode() {
+        isGoalModeEnabled.toggle()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+        if isGoalModeEnabled {
+            resetVoiceInteractionState(hideOverlay: true, keepTencentWarm: false)
+            inputMode = .text
+        }
+    }
+
+    private func goalModeText(for text: String) -> String {
+        """
+        /goal
+        请使用 goal 模式，先创建一个 goal，然后持续推进直到完成或明确阻塞：
+
+        \(text)
+        """
+    }
+
+    private func syncVoiceOverlayRuntimeFromState() {
+        guard inputMode == .voice else {
+            voiceOverlayRuntime.hide()
+            return
+        }
+
+        if isVoicePressing || voiceDisplayState.isActive || isFinalizingVoice {
+            voiceOverlayRuntime.show(
+                canceling: isCancelingVoice,
+                finalizing: isFinalizingVoice,
+                starting: voiceDisplayState.isStarting || isVoicePressing,
+                listening: voiceDisplayState.isListening
+            )
+        } else {
+            voiceOverlayRuntime.hide()
+        }
+    }
+
+    @discardableResult
+    private func beginVoiceInput(touchStartedAt: CFTimeInterval = CACurrentMediaTime()) -> Bool {
+        guard !voiceRuntime.isPressing else { return false }
+        guard !voiceDisplayState.isActive else { return false }
+
+        voiceRuntime.reset()
+        voiceRuntime.isPressing = true
+        voiceRuntime.pressStartedAt = touchStartedAt
+        logVoiceTiming("press-callback")
+        voicePrepareTask?.cancel()
+        voicePrepareTask = nil
+
+        guard voiceRuntime.isPressing, !voiceRuntime.hasStartedSession else { return true }
+        let didStart = startVoiceInputAfterTouchFeedback()
+        logVoiceTiming("press-start-returned")
+        guard didStart else { return false }
+
+        scheduleVoicePressUIAfterStart(pressStartedAt: touchStartedAt)
+        return didStart
+    }
+
+    private func scheduleVoicePressUIAfterStart(pressStartedAt: CFTimeInterval) {
+        DispatchQueue.main.async {
+            guard voiceRuntime.pressStartedAt == pressStartedAt,
+                  voiceRuntime.isPressing,
+                  voiceRuntime.hasStartedSession
+            else { return }
+
+            applyVoicePressUIAfterStart(pressStartedAt: pressStartedAt)
+        }
+    }
+
+    private func applyVoicePressUIAfterStart(pressStartedAt: CFTimeInterval) {
+        voiceOverlayRuntime.show(
+            canceling: false,
+            finalizing: false,
+            starting: true,
+            listening: false,
+            pressStartedAt: pressStartedAt
+        )
+        logVoiceTiming("overlay-visible-after-start")
+
+        let shouldClearRefineBeforeSend = shouldRefineBeforeSend
+        let shouldClearVoiceEndState = isFinalizingVoice || isCancelingVoice
+        let needsSwiftUIPressState = !inputText.isEmpty ||
+            shouldClearRefineBeforeSend ||
+            shouldClearVoiceEndState
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            if needsSwiftUIPressState {
+                isVoicePressing = true
+            }
+            if shouldClearRefineBeforeSend {
+                shouldRefineBeforeSend = false
+            }
+            if shouldClearVoiceEndState {
+                isFinalizingVoice = false
+                isCancelingVoice = false
+            }
+        }
+        logVoiceTiming("press-ui-state-finished")
+    }
+
+    @discardableResult
+    private func startVoiceInputAfterTouchFeedback() -> Bool {
+        // Preparing on every touch blocks the perceived press path. The controller
+        // keeps a prepared/warm session from onAppear and the previous recording.
+        let didStart = voiceInput.start(
+            settings: settings,
+            backgroundAudio: backgroundAudio,
+            diagnosticStartTime: voiceRuntime.pressStartedAt,
+            notifyStartingImmediately: false,
+            notifyLifecycleState: false
+        ) { transcript in
+            voiceRuntime.transcriptText = transcript
+            voiceRuntime.hasNonEmptyTranscript = !transcript.isEmpty
+            logFirstVoiceTranscriptIfNeeded()
+        } onListening: {
+            voiceOverlayRuntime.show(canceling: false, finalizing: false, starting: false, listening: true)
+            logVoiceTiming("record-listening")
+        }
+        if didStart {
+            voiceRuntime.hasStartedSession = true
+            logVoiceTiming("sdk-start-called")
+        } else {
+            resetVoiceInteractionState(hideOverlay: true)
+        }
+        return didStart
+    }
+
+    private func resetVoiceInteractionState(hideOverlay: Bool = false, keepTencentWarm: Bool = true) {
+        voiceRuntime.reset()
+        voicePrepareTask?.cancel()
+        voicePrepareTask = nil
+        voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: keepTencentWarm)
+        clearVoiceGestureState()
+        if hideOverlay {
+            voiceOverlayRuntime.hide()
+        }
+    }
+
+    private func clearVoiceGestureState() {
+        isVoicePressing = false
+        if isFinalizingVoice || isCancelingVoice {
+            isFinalizingVoice = false
+            isCancelingVoice = false
+        }
+    }
+
+    private func endVoiceInput() {
+        guard voiceRuntime.isPressing || voiceDisplayState.isActive else { return }
+
+        if voiceRuntime.isPressing, !voiceRuntime.hasStartedSession, !voiceDisplayState.isActive {
+            voiceRuntime.reset()
+            clearVoiceGestureState()
+            voiceOverlayRuntime.hide()
+            return
+        }
+
+        voiceRuntime.isPressing = false
+        isVoicePressing = false
+        isCancelingVoice = false
+        isFinalizingVoice = true
+        voiceOverlayRuntime.show(canceling: false, finalizing: true, starting: false, listening: false)
+        voiceRuntime.finalizeTask?.cancel()
+        let finalizeDelay: Duration = voiceRuntime.hasTranscript ? .milliseconds(260) : .milliseconds(760)
+        voiceRuntime.finalizeTask = Task {
+            try? await Task.sleep(for: finalizeDelay)
+            await MainActor.run {
+                finalizeVoiceInput()
+            }
+        }
+    }
+
+    private func finalizeVoiceInput() {
+        let transcript = (voiceRuntime.transcriptText.isEmpty ? voiceInput.latestTranscript : voiceRuntime.transcriptText)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !transcript.isEmpty {
+            inputText = mergedVoiceText(base: inputText, transcript: transcript)
+            shouldRefineBeforeSend = settings.voiceRecognitionProvider == .apple
+            inputMode = .voice
+        }
+        voiceRuntime.reset()
+        clearVoiceGestureState()
+        voiceInput.stop(backgroundAudio: backgroundAudio)
+        voiceOverlayRuntime.hide()
+        scheduleVoiceInputPrepare(force: true, after: .milliseconds(40))
+    }
+
+    private func cancelVoiceInput() {
+        voiceRuntime.reset()
+        clearVoiceGestureState()
+        voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: true)
+        voiceOverlayRuntime.hide()
+        scheduleVoiceInputPrepare(after: .milliseconds(40))
+        triggerVoiceCanceledHaptic()
+    }
+
+    private func scheduleVoiceInputPrepare(force: Bool = false, after delay: Duration = .milliseconds(40)) {
+        voicePrepareTask?.cancel()
+        voicePrepareTask = Task {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                voicePrepareTask = nil
+                prepareVoiceInputIfIdle(force: force)
+            }
+        }
+    }
+
+    private func prepareVoiceInputIfIdle(force: Bool = false) {
+        guard !voiceRuntime.isPressing, !voiceDisplayState.isActive, inputMode == .voice else { return }
+        voiceInput.prepare(settings: settings, force: force)
+    }
+
+    private func updateVoiceCancelVisualState(_ isCanceling: Bool) {
+        voiceOverlayRuntime.show(canceling: isCanceling, finalizing: false, starting: false, listening: true)
+    }
+
+    private func triggerCancelZoneHaptic() {
+        Haptics.cancelZoneEntered()
+    }
+
+    private func triggerVoiceCanceledHaptic() {
+        Haptics.voiceCanceled()
+    }
+
+    private func logFirstVoiceTranscriptIfNeeded() {
+        guard !voiceRuntime.didLogFirstTranscript,
+              !voiceRuntime.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+
+        voiceRuntime.didLogFirstTranscript = true
+        logVoiceTiming("first-transcript")
+    }
+
+    private func logVoiceTiming(_ event: String) {
+        guard voiceRuntime.pressStartedAt > 0 else { return }
+        let elapsedMilliseconds = Int((CACurrentMediaTime() - voiceRuntime.pressStartedAt) * 1_000)
+        VoiceInputDiagnostics.timing(event, elapsedMilliseconds: elapsedMilliseconds)
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    private func mergedVoiceText(base: String, transcript: String) -> String {
+        let speechText = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !speechText.isEmpty else { return base }
+
+        guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return speechText
+        }
+
+        let separator = base.hasSuffix(" ") || base.hasSuffix("\n") ? "" : "\n"
+        return base + separator + speechText
+    }
+
+    private func mergedDraftText(base: String, addition: String) -> String {
+        let draft = addition.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !draft.isEmpty else { return base }
+
+        guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return draft
+        }
+
+        let separator = base.hasSuffix("\n") ? "\n" : "\n\n"
+        return base + separator + draft
+    }
+
+    private func imagePrompt(for path: String) -> String {
+        """
+        我从手机上传了一张图片，已经保存到这台 Mac 的本地路径：
+        \(path)
+
+        请先读取并查看这张图片，然后根据图片内容继续处理。
+        """
+    }
+}
+
+private enum ImageUploadCompressor {
+    private static let maxPixelSize = 1600
+    private static let targetBytes = 1_100_000
+    private static let qualities: [CGFloat] = [0.78, 0.7, 0.62, 0.54, 0.46, 0.38]
+
+    static func compressedJPEGData(from data: Data) -> Data? {
+        guard let image = downsampledImage(from: data) else { return nil }
+
+        var smallest: Data?
+        for quality in qualities {
+            guard let jpeg = image.jpegData(compressionQuality: quality) else { continue }
+            smallest = jpeg
+            if jpeg.count <= targetBytes {
+                return jpeg
+            }
+        }
+
+        return smallest
+    }
+
+    private static func downsampledImage(from data: Data) -> UIImage? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options) else {
+            return UIImage(data: data)
+        }
+
+        let thumbnailOptions = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ] as CFDictionary
+
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
+            return UIImage(data: data)
+        }
+
+        return UIImage(cgImage: cgImage)
+    }
+}
+
+private struct ImageSendFeedback: Identifiable, Equatable {
+    enum State: Equatable {
+        case progress
+        case success
+        case failure
+    }
+
+    let id = UUID()
+    let state: State
+    let message: String
+
+    static func progress(_ message: String) -> ImageSendFeedback {
+        ImageSendFeedback(state: .progress, message: message)
+    }
+
+    static func success(_ message: String) -> ImageSendFeedback {
+        ImageSendFeedback(state: .success, message: message)
+    }
+
+    static func failure(_ message: String) -> ImageSendFeedback {
+        ImageSendFeedback(state: .failure, message: message)
+    }
+
+    var systemImage: String {
+        switch state {
+        case .progress: "photo.badge.arrow.down"
+        case .success: "checkmark.circle.fill"
+        case .failure: "exclamationmark.triangle.fill"
+        }
+    }
+
+    var tint: Color {
+        switch state {
+        case .progress: .secondary
+        case .success: .green
+        case .failure: .red
+        }
+    }
+}
+
+private struct AutoScrollingComposerTextView: View {
+    @Binding var text: String
+    @Binding var measuredHeight: CGFloat
+    let maxLines: Int
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            AutoScrollingTextView(
+                text: $text,
+                measuredHeight: $measuredHeight,
+                minLines: 1,
+                maxLines: maxLines
+            )
+
+            if text.isEmpty {
+                Text("Send to agent...")
+                    .font(.system(size: 16))
+                    .foregroundColor(Color(.placeholderText))
+                    .padding(.top, 1)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+private struct DraftEditorSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    @Binding var text: String
+    let isSending: Bool
+    let onSend: () -> Void
+
+    private var canSend: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSending
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 12) {
+                AutoScrollingTextView(
+                    text: $text,
+                    measuredHeight: .constant(0),
+                    minLines: 12,
+                    maxLines: 12
+                )
+                .padding(14)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(AgentMonitorTheme.elevatedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
+                )
+
+                HStack {
+                    Text("\(text.count) chars")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.secondary)
+
+                    Spacer()
+
+                    Button {
+                        onSend()
+                    } label: {
+                        Label(isSending ? "Sending" : "Send", systemImage: "arrow.up.circle.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canSend)
+                }
+            }
+            .padding(16)
+            .background(AgentMonitorTheme.backgroundGradient(for: colorScheme))
+            .navigationTitle("Review Draft")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+}
+
+private struct FloatingVoiceTextDraft: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Binding var text: String
+    @Binding var measuredHeight: CGFloat
+    let maxLines: Int
+    let isSending: Bool
+    let onCancel: () -> Void
+    let onSend: () -> Void
+
+    private var canSend: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSending
+    }
+
+    var body: some View {
+        BottomInteractionBackdrop {
+            ZStack(alignment: .bottomTrailing) {
+                AutoScrollingTextView(
+                    text: $text,
+                    measuredHeight: $measuredHeight,
+                    minLines: 2,
+                    maxLines: maxLines
+                )
+                .padding(.horizontal, 18)
+                .padding(.top, 16)
+                .padding(.bottom, 20)
+                .frame(height: measuredHeight + 36)
+                .background(bubbleColor, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay(alignment: .bottomTrailing) {
+                    BubbleTail()
+                        .fill(bubbleColor)
+                        .frame(width: 32, height: 24)
+                        .offset(x: -42, y: 17)
+                }
+                .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: 14, x: 0, y: 6)
+                .animation(.easeOut(duration: 0.18), value: measuredHeight)
+            }
+
+            HStack(alignment: .bottom, spacing: 28) {
+                BottomIconAction(
+                    title: "取消",
+                    systemImage: "xmark",
+                    action: onCancel
+                )
+
+                Spacer(minLength: 0)
+
+                Button {
+                    onSend()
+                } label: {
+                    HStack(spacing: 8) {
+                        if isSending {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(isSending ? "发送中" : "发送")
+                            .font(.system(size: 24, weight: .medium))
+                    }
+                    .foregroundColor(sendForegroundColor)
+                    .frame(width: 176, height: 72)
+                    .background(sendBackgroundColor, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend)
+            }
+            .padding(.horizontal, 24)
+        }
+    }
+
+    private var bubbleColor: Color {
+        colorScheme == .dark
+            ? Color(red: 0.44, green: 0.82, blue: 0.35)
+            : Color(red: 0.56, green: 0.92, blue: 0.39)
+    }
+
+    private var sendBackgroundColor: Color {
+        if colorScheme == .dark {
+            return Color.white.opacity(canSend ? 0.16 : 0.08)
+        }
+        return Color.white.opacity(canSend ? 0.92 : 0.52)
+    }
+
+    private var sendForegroundColor: Color {
+        if colorScheme == .dark {
+            return Color.white.opacity(canSend ? 0.92 : 0.38)
+        }
+        return Color.black.opacity(canSend ? 0.88 : 0.34)
+    }
+}
+
+private struct BottomInteractionBackdrop<Content: View>: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(spacing: 22) {
+            content
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 18)
+        .padding(.top, 54)
+        .padding(.bottom, 10)
+        .background(
+            VStack(spacing: 0) {
+                LinearGradient(
+                    colors: [
+                        AgentMonitorTheme.pageBackground(for: colorScheme).opacity(0),
+                        AgentMonitorTheme.pageBackground(for: colorScheme)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 46)
+
+                AgentMonitorTheme.pageBackground(for: colorScheme)
+            }
+                .ignoresSafeArea(edges: .bottom)
+        )
+    }
+}
+
+private struct BottomIconAction: View {
+    @Environment(\.colorScheme) private var colorScheme
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.18))
+                    Image(systemName: systemImage)
+                        .font(.system(size: 28, weight: .medium))
+                        .foregroundColor(colorScheme == .dark ? .white.opacity(0.92) : .white)
+                }
+                .frame(width: 72, height: 72)
+
+                Text(title)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.66))
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct BubbleTail: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.midX, y: rect.maxY),
+            control: CGPoint(x: rect.maxX * 0.64, y: rect.maxY * 0.96)
+        )
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX, y: rect.minY),
+            control: CGPoint(x: rect.minX + rect.width * 0.28, y: rect.maxY * 0.72)
+        )
+        return path
+    }
+}
+
+private enum ComposerInputMode {
+    case text
+    case voice
+}
+
+private struct VoiceRecordingOverlaySnapshot {
+    var isVisible: Bool
+    var isCanceling: Bool
+    var isFinalizing: Bool
+    var isStarting: Bool
+    var isListening: Bool
+    var sequence: UInt64
+    var pressStartedAt: CFTimeInterval
+
+    func hasSameState(as other: VoiceRecordingOverlaySnapshot) -> Bool {
+        isVisible == other.isVisible &&
+            isCanceling == other.isCanceling &&
+            isFinalizing == other.isFinalizing &&
+            isStarting == other.isStarting &&
+            isListening == other.isListening &&
+            pressStartedAt == other.pressStartedAt
+    }
+}
+
+@MainActor
+private final class VoiceRecordingOverlayRuntime {
+    private var observers: [UUID: (VoiceRecordingOverlaySnapshot) -> Void] = [:]
+    private var sequence: UInt64 = 0
+    private var snapshot = VoiceRecordingOverlaySnapshot(
+        isVisible: false,
+        isCanceling: false,
+        isFinalizing: false,
+        isStarting: false,
+        isListening: false,
+        sequence: 0,
+        pressStartedAt: 0
+    )
+
+    func show(
+        canceling: Bool,
+        finalizing: Bool,
+        starting: Bool,
+        listening: Bool,
+        pressStartedAt: CFTimeInterval = 0
+    ) {
+        update(
+            VoiceRecordingOverlaySnapshot(
+                isVisible: true,
+                isCanceling: canceling,
+                isFinalizing: finalizing,
+                isStarting: starting,
+                isListening: listening,
+                sequence: sequence + 1,
+                pressStartedAt: pressStartedAt
+            )
+        )
+    }
+
+    func hide() {
+        update(
+            VoiceRecordingOverlaySnapshot(
+                isVisible: false,
+                isCanceling: false,
+                isFinalizing: false,
+                isStarting: false,
+                isListening: false,
+                sequence: sequence + 1,
+                pressStartedAt: 0
+            )
+        )
+    }
+
+    @discardableResult
+    func addObserver(_ observer: @escaping (VoiceRecordingOverlaySnapshot) -> Void) -> UUID {
+        let id = UUID()
+        observers[id] = observer
+        observer(snapshot)
+        return id
+    }
+
+    func removeObserver(_ id: UUID) {
+        observers[id] = nil
+    }
+
+    private func update(_ nextSnapshot: VoiceRecordingOverlaySnapshot) {
+        guard !snapshot.hasSameState(as: nextSnapshot) else { return }
+        snapshot = nextSnapshot
+        sequence = nextSnapshot.sequence
+        for observer in observers.values {
+            observer(nextSnapshot)
+        }
+    }
+}
+
+@MainActor
+private final class VoiceInputRuntimeState {
+    var transcriptText = ""
+    var finalizeTask: Task<Void, Never>?
+    var isPressing = false
+    var pressStartedAt: CFTimeInterval = 0
+    var didLogFirstTranscript = false
+    var hasStartedSession = false
+    var hasNonEmptyTranscript = false
+
+    var hasTranscript: Bool {
+        hasNonEmptyTranscript
+    }
+
+	    func reset() {
+	        finalizeTask?.cancel()
+	        finalizeTask = nil
+        isPressing = false
+        pressStartedAt = 0
+        didLogFirstTranscript = false
+        hasStartedSession = false
+        hasNonEmptyTranscript = false
+        transcriptText = ""
+    }
+}
+
+@MainActor
+@Observable
+private final class VoiceDisplayState {
+    private struct Snapshot: Equatable {
+        var phase: VoiceInputPhase
+        var errorMessage: String?
+    }
+
+    @ObservationIgnored private var observerID: UUID?
+    private var snapshot = Snapshot(phase: .idle, errorMessage: nil)
+
+    var phase: VoiceInputPhase { snapshot.phase }
+    var errorMessage: String? { snapshot.errorMessage }
+    var isActive: Bool { phase.isActive }
+    var isStarting: Bool { phase.isStarting }
+    var isListening: Bool { phase.isListening }
+    var statusText: String? { phase.statusText }
+
+    func attach(to voiceInput: VoiceInputController) {
+        guard observerID == nil else { return }
+        observerID = voiceInput.addStateObserver { [weak self] phase, errorMessage in
+            self?.apply(phase: phase, errorMessage: errorMessage)
+        }
+    }
+
+    func detach(from voiceInput: VoiceInputController) {
+        if let observerID {
+            voiceInput.removeStateObserver(observerID)
+        }
+        observerID = nil
+        apply(phase: .idle, errorMessage: nil)
+    }
+
+    private func apply(phase: VoiceInputPhase, errorMessage: String?) {
+        let nextSnapshot = Snapshot(phase: phase, errorMessage: errorMessage)
+        guard snapshot != nextSnapshot else { return }
+        snapshot = nextSnapshot
+    }
+}
+
+private struct ComposerIconLabel: View {
+    let systemImage: String
+    let isLoading: Bool
+
+    var body: some View {
+        ZStack {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: systemImage)
+                    .font(.system(size: iconSize, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.7))
+            }
+        }
+        .frame(width: 38, height: 44)
+        .contentShape(Rectangle())
+    }
+
+    private var iconSize: CGFloat {
+        switch systemImage {
+        case "keyboard":
+            20
+        case "arrow.up.circle.fill":
+            24
+        default:
+            21
+        }
+    }
+}
+
+private struct VoiceRecordingOverlay: UIViewRepresentable {
+    let isVisible: Bool
+    let isCanceling: Bool
+    let isFinalizing: Bool
+    let isStarting: Bool
+    let isListening: Bool
+    let pageBackgroundColor: UIColor
+    let runtime: VoiceRecordingOverlayRuntime
+    let voiceInput: VoiceInputController
+
+    func makeUIView(context: Context) -> VoiceRecordingOverlayView {
+        let view = VoiceRecordingOverlayView()
+        context.coordinator.attach(view: view, to: voiceInput)
+        context.coordinator.attachRuntime(runtime)
+        view.update(
+            isVisible: isVisible,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing,
+            isStarting: isStarting,
+            isListening: isListening,
+            pageBackgroundColor: pageBackgroundColor,
+            animated: false
+        )
+        return view
+    }
+
+    func updateUIView(_ view: VoiceRecordingOverlayView, context: Context) {
+        context.coordinator.attach(view: view, to: voiceInput)
+        context.coordinator.attachRuntime(runtime)
+        view.update(
+            isVisible: isVisible,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing,
+            isStarting: isStarting,
+            isListening: isListening,
+            pageBackgroundColor: pageBackgroundColor,
+            animated: true
+        )
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    static func dismantleUIView(_ view: VoiceRecordingOverlayView, coordinator: Coordinator) {
+        coordinator.detach()
+        view.stop()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private weak var view: VoiceRecordingOverlayView?
+        private weak var voiceInput: VoiceInputController?
+        private var observerID: UUID?
+        private var runtimeObserverID: UUID?
+        private weak var runtime: VoiceRecordingOverlayRuntime?
+
+        func attach(view: VoiceRecordingOverlayView, to voiceInput: VoiceInputController) {
+            if self.view === view, self.voiceInput === voiceInput, observerID != nil {
+                return
+            }
+
+            detach()
+            self.view = view
+            self.voiceInput = voiceInput
+            observerID = voiceInput.addAudioLevelObserver { [weak view] level in
+                view?.updateAudioLevel(level)
+            }
+        }
+
+        func detach() {
+            if let observerID {
+                voiceInput?.removeAudioLevelObserver(observerID)
+            }
+            if let runtimeObserverID {
+                runtime?.removeObserver(runtimeObserverID)
+            }
+            observerID = nil
+            runtimeObserverID = nil
+            voiceInput = nil
+            runtime = nil
+            view = nil
+        }
+
+        func attachRuntime(_ runtime: VoiceRecordingOverlayRuntime) {
+            if self.runtime === runtime, runtimeObserverID != nil {
+                return
+            }
+
+            if let runtimeObserverID {
+                self.runtime?.removeObserver(runtimeObserverID)
+            }
+            self.runtime = runtime
+            runtimeObserverID = runtime.addObserver { [weak self] snapshot in
+                self?.view?.apply(snapshot: snapshot)
+            }
+        }
+    }
+}
+
+private final class VoiceRecordingOverlayView: UIView {
+    private let gradientLayer = CAGradientLayer()
+    private let solidLayer = CALayer()
+    private let capsuleLayer = CAShapeLayer()
+    private let waveformView = VoiceWaveformView()
+    private let promptLabel = UILabel()
+    private var isVisibleValue = false
+    private var isCancelingValue = false
+    private var isFinalizingValue = false
+    private var isStartingValue = false
+    private var isListeningValue = false
+    private var pageBackgroundColorValue = UIColor.systemBackground
+    private var lastRuntimeSequence: UInt64 = 0
+    private var didLogFirstVisibleRuntimeFrame = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        gradientLayer.frame = CGRect(x: 0, y: 0, width: bounds.width, height: 54)
+        solidLayer.frame = CGRect(x: 0, y: 46, width: bounds.width, height: max(bounds.height - 46, 0))
+
+        let contentTop: CGFloat = 58
+        waveformView.frame = CGRect(x: (bounds.width - 154) / 2, y: contentTop, width: 154, height: 24)
+        promptLabel.frame = CGRect(x: 18, y: contentTop + 34, width: max(bounds.width - 36, 0), height: 22)
+
+        let capsuleFrame = CGRect(x: 36, y: bounds.height - 62, width: max(bounds.width - 72, 0), height: 52)
+        capsuleLayer.path = UIBezierPath(roundedRect: capsuleFrame, cornerRadius: 26).cgPath
+    }
+
+    func update(
+        isVisible: Bool,
+        isCanceling: Bool,
+        isFinalizing: Bool,
+        isStarting: Bool,
+        isListening: Bool,
+        pageBackgroundColor: UIColor,
+        animated: Bool
+    ) {
+        if lastRuntimeSequence > 0 {
+            updateBackgroundColor(pageBackgroundColor)
+            return
+        }
+
+        applyState(
+            isVisible: isVisible,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing,
+            isStarting: isStarting,
+            isListening: isListening,
+            pageBackgroundColor: pageBackgroundColor,
+            animated: animated
+        )
+    }
+
+    private func applyState(
+        isVisible: Bool,
+        isCanceling: Bool,
+        isFinalizing: Bool,
+        isStarting: Bool,
+        isListening: Bool,
+        pageBackgroundColor: UIColor,
+        animated: Bool
+    ) {
+        let visibilityChanged = isVisibleValue != isVisible
+        isVisibleValue = isVisible
+        isCancelingValue = isCanceling
+        isFinalizingValue = isFinalizing
+        isStartingValue = isStarting
+        isListeningValue = isListening
+        pageBackgroundColorValue = pageBackgroundColor
+
+        let tint = isCanceling ? UIColor.systemRed : UIColor(red: 0.32, green: 0.64, blue: 0.38, alpha: 1)
+        let prompt: String
+        if isCanceling {
+            prompt = "松开取消"
+        } else if isFinalizing {
+            prompt = "正在转换文字"
+        } else if isStarting {
+            prompt = "正在启动语音"
+        } else {
+            prompt = "松开发送  上滑取消"
+        }
+
+        updateBackgroundColor(pageBackgroundColor)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        capsuleLayer.fillColor = tint.cgColor
+        CATransaction.commit()
+
+        promptLabel.text = prompt
+        promptLabel.textColor = isCanceling ? .systemRed : .label
+        waveformView.update(
+            tintColor: tint,
+            isAnimating: isAnimating,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing
+        )
+
+        let alpha: CGFloat = isVisible ? 1 : 0
+        let transform = isVisible ? CGAffineTransform.identity : CGAffineTransform(translationX: 0, y: 14)
+        if animated && visibilityChanged {
+            UIView.animate(
+                withDuration: 0.16,
+                delay: 0,
+                options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseOut]
+            ) {
+                self.alpha = alpha
+                self.transform = transform
+            }
+        } else {
+            self.alpha = alpha
+            self.transform = transform
+        }
+
+        if !isVisible {
+            waveformView.updateAudioLevel(0)
+        }
+        setNeedsLayout()
+    }
+
+	    func apply(snapshot: VoiceRecordingOverlaySnapshot) {
+        guard snapshot.sequence != lastRuntimeSequence else { return }
+        lastRuntimeSequence = snapshot.sequence
+        if snapshot.isVisible, !didLogFirstVisibleRuntimeFrame {
+            didLogFirstVisibleRuntimeFrame = true
+            if snapshot.pressStartedAt > 0 {
+                let elapsedMilliseconds = Int((CACurrentMediaTime() - snapshot.pressStartedAt) * 1_000)
+                VoiceInputDiagnostics.timing("overlay-runtime-applied", elapsedMilliseconds: elapsedMilliseconds)
+            }
+        } else if !snapshot.isVisible {
+            didLogFirstVisibleRuntimeFrame = false
+        }
+        let animated = isVisibleValue || !snapshot.isVisible
+        applyState(
+            isVisible: snapshot.isVisible,
+            isCanceling: snapshot.isCanceling,
+            isFinalizing: snapshot.isFinalizing,
+            isStarting: snapshot.isStarting,
+            isListening: snapshot.isListening,
+            pageBackgroundColor: pageBackgroundColorValue,
+            animated: animated
+        )
+    }
+
+    private func updateBackgroundColor(_ pageBackgroundColor: UIColor) {
+        pageBackgroundColorValue = pageBackgroundColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        gradientLayer.colors = [
+            pageBackgroundColor.withAlphaComponent(0).cgColor,
+            pageBackgroundColor.cgColor
+        ]
+        solidLayer.backgroundColor = pageBackgroundColor.cgColor
+        CATransaction.commit()
+    }
+
+    func updateAudioLevel(_ level: CGFloat) {
+        waveformView.updateAudioLevel(level)
+    }
+
+    func stop() {
+        waveformView.stopDisplayLink()
+    }
+
+    private var isAnimating: Bool {
+        isListeningValue || isStartingValue
+    }
+
+    private func setup() {
+        isOpaque = false
+        isUserInteractionEnabled = false
+        alpha = 0
+
+        gradientLayer.startPoint = CGPoint(x: 0.5, y: 0)
+        gradientLayer.endPoint = CGPoint(x: 0.5, y: 1)
+        layer.addSublayer(gradientLayer)
+        layer.addSublayer(solidLayer)
+        layer.addSublayer(capsuleLayer)
+
+        addSubview(waveformView)
+
+        promptLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        promptLabel.textAlignment = .center
+        addSubview(promptLabel)
+    }
+}
+
+private final class VoiceWaveformView: UIView {
+    private let barCount = 13
+    private let minHeight: CGFloat = 4
+    private let barProfiles: [(centerBoost: CGFloat, idle: CGFloat, phaseA: Double, phaseB: Double, phaseC: Double)] = {
+        let count = 13
+        return (0..<count).map { index in
+            let position = CGFloat(index) / CGFloat(max(count - 1, 1))
+            let centerDistance = abs(position - 0.5) * 2
+            return (
+                centerBoost: 1 - centerDistance * 0.28,
+                idle: 0.08 + (1 - centerDistance) * 0.05,
+                phaseA: Double(index) * 0.86,
+                phaseB: Double(index) * 0.38,
+                phaseC: Double(index) * 1.9
+            )
+        }
+    }()
+    private var barLayers: [CALayer] = []
+    private var displayLink: CADisplayLink?
+    private var startTime = CACurrentMediaTime()
+    private var tintColorValue = UIColor.systemGreen
+    private var isAnimatingValue = false
+    private var isCancelingValue = false
+    private var isFinalizingValue = false
+    private var audioLevelValue: CGFloat = 0
+    private var lastRenderedBounds: CGRect = .null
+    private var lastRenderedHeights: [CGFloat] = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        setupBars()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        backgroundColor = .clear
+        isOpaque = false
+        setupBars()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        renderBars(force: bounds != lastRenderedBounds)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            stopDisplayLink()
+        } else {
+            updateDisplayLink()
+        }
+    }
+
+    func update(
+        tintColor: UIColor,
+        isAnimating: Bool,
+        isCanceling: Bool,
+        isFinalizing: Bool
+    ) {
+        let shouldRedraw = tintColorValue != tintColor ||
+            isAnimatingValue != isAnimating ||
+            isCancelingValue != isCanceling ||
+            isFinalizingValue != isFinalizing
+
+        tintColorValue = tintColor
+        isAnimatingValue = isAnimating
+        isCancelingValue = isCanceling
+        isFinalizingValue = isFinalizing
+
+        if shouldRedraw {
+            lastRenderedHeights = Array(repeating: -1, count: barCount)
+        }
+        updateDisplayLink()
+        if shouldRedraw {
+            renderBars(force: true)
+        }
+    }
+
+    func updateAudioLevel(_ audioLevel: CGFloat) {
+        let clampedLevel = min(max(audioLevel, 0), 1)
+        guard abs(audioLevelValue - clampedLevel) > 0.01 else { return }
+        audioLevelValue = clampedLevel
+        updateDisplayLink()
+        renderBars(force: false)
+    }
+
+    private func updateDisplayLink() {
+        let shouldAnimate = isCancelingValue || isFinalizingValue || audioLevelValue > 0.02
+        if shouldAnimate, displayLink == nil {
+            startTime = CACurrentMediaTime()
+            let link = CADisplayLink(target: self, selector: #selector(displayTick))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 8, maximum: 12, preferred: 12)
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        } else if !shouldAnimate, displayLink != nil {
+            displayLink?.invalidate()
+            displayLink = nil
+        }
+    }
+
+    func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    @objc private func displayTick() {
+        renderBars(force: false)
+    }
+
+    private func setupBars() {
+        guard barLayers.isEmpty else { return }
+        for _ in 0..<barCount {
+            let layer = CALayer()
+            layer.backgroundColor = tintColorValue.cgColor
+            layer.cornerRadius = 1.5
+            layer.actions = [
+                "bounds": NSNull(),
+                "position": NSNull(),
+                "backgroundColor": NSNull(),
+                "cornerRadius": NSNull()
+            ]
+            self.layer.addSublayer(layer)
+            barLayers.append(layer)
+            lastRenderedHeights.append(-1)
+        }
+    }
+
+    private func renderBars(force: Bool) {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+
+        let time = CACurrentMediaTime() - startTime
+        let spacing: CGFloat = 5
+        let barWidth: CGFloat = 3
+        let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * spacing
+        let startX = max((bounds.width - totalWidth) / 2, 0)
+        let maxHeight = max(bounds.height - 2, minHeight)
+        let roundedTint = tintColorValue.cgColor
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for index in 0..<barCount {
+            let rawHeight = barHeight(index: index, time: time, maxHeight: maxHeight)
+            let height = round(rawHeight * UIScreen.main.scale) / UIScreen.main.scale
+            guard force ||
+                index >= lastRenderedHeights.count ||
+                abs(lastRenderedHeights[index] - height) > 0.5
+            else { continue }
+
+            let x = startX + CGFloat(index) * (barWidth + spacing)
+            barLayers[index].cornerRadius = barWidth / 2
+            barLayers[index].backgroundColor = roundedTint
+            barLayers[index].frame = CGRect(
+                x: x,
+                y: (bounds.height - height) / 2,
+                width: barWidth,
+                height: height
+            )
+            if index < lastRenderedHeights.count {
+                lastRenderedHeights[index] = height
+            }
+        }
+        CATransaction.commit()
+        lastRenderedBounds = bounds
+    }
+
+    private func barHeight(index: Int, time: TimeInterval, maxHeight: CGFloat) -> CGFloat {
+        let profile = barProfiles[index]
+        if isCancelingValue {
+            return cancelHeight(profile: profile, time: time, maxHeight: maxHeight)
+        }
+
+        if isFinalizingValue {
+            return finalizingHeight(profile: profile, time: time, maxHeight: maxHeight)
+        }
+
+        guard isAnimatingValue, audioLevelValue > 0.02 else {
+            return idleHeight(profile: profile, maxHeight: maxHeight)
+        }
+
+        let beat = CGFloat((sin(time * 8.0 + profile.phaseA) + 1) * 0.5)
+        let normalized = min(1, 0.08 + audioLevelValue * 0.46 + beat * audioLevelValue * 0.20)
+        return minHeight + (maxHeight - minHeight) * normalized * profile.centerBoost
+    }
+
+    private func idleHeight(
+        profile: (centerBoost: CGFloat, idle: CGFloat, phaseA: Double, phaseB: Double, phaseC: Double),
+        maxHeight: CGFloat
+    ) -> CGFloat {
+        return minHeight + (maxHeight - minHeight) * profile.idle
+    }
+
+    private func finalizingHeight(
+        profile: (centerBoost: CGFloat, idle: CGFloat, phaseA: Double, phaseB: Double, phaseC: Double),
+        time: TimeInterval,
+        maxHeight: CGFloat
+    ) -> CGFloat {
+        let pulse = CGFloat((sin(time * 3.2 + profile.phaseB) + 1) * 0.5)
+        let normalized = 0.32 + pulse * 0.22 + profile.idle
+        return minHeight + (maxHeight - minHeight) * normalized
+    }
+
+    private func cancelHeight(
+        profile: (centerBoost: CGFloat, idle: CGFloat, phaseA: Double, phaseB: Double, phaseC: Double),
+        time: TimeInterval,
+        maxHeight: CGFloat
+    ) -> CGFloat {
+        let jitter = CGFloat((sin(time * 15.0 + profile.phaseC) + 1) * 0.5)
+        return minHeight + (maxHeight - minHeight) * (0.18 + jitter * 0.14)
+    }
+}
+
+private struct HoldToSpeakButton: View {
+    let isActive: Bool
+    let isStarting: Bool
+    let isListening: Bool
+    let isPressing: Bool
+	    let isCanceling: Bool
+	    let isFinalizing: Bool
+	    let onPressStart: (CFTimeInterval) -> Bool
+	    let onPressEnd: () -> Void
+    let onCancelStateChange: (Bool) -> Void
+    let onEnterCancelZone: () -> Void
+    let onPressCancel: () -> Void
+
+    private let cancelThreshold: CGFloat = -38
+
+    var body: some View {
+        HoldToSpeakControl(
+            isActive: isActive,
+            isStarting: isStarting,
+            isListening: isListening,
+            isPressing: isPressing,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing,
+            cancelThreshold: cancelThreshold,
+            onPressStart: onPressStart,
+            onPressEnd: onPressEnd,
+            onCancelStateChange: onCancelStateChange,
+            onEnterCancelZone: onEnterCancelZone,
+            onPressCancel: onPressCancel
+        )
+        .frame(maxWidth: .infinity)
+        .frame(height: 34)
+        .accessibilityLabel(isActive ? "Release to convert voice input" : "Hold to speak")
+    }
+}
+
+private struct HoldToSpeakControl: UIViewRepresentable {
+    let isActive: Bool
+    let isStarting: Bool
+    let isListening: Bool
+    let isPressing: Bool
+    let isCanceling: Bool
+    let isFinalizing: Bool
+    let cancelThreshold: CGFloat
+	    let onPressStart: (CFTimeInterval) -> Bool
+	    let onPressEnd: () -> Void
+    let onCancelStateChange: (Bool) -> Void
+    let onEnterCancelZone: () -> Void
+    let onPressCancel: () -> Void
+
+    func makeUIView(context: Context) -> HoldToSpeakUIView {
+	        let view = HoldToSpeakUIView()
+	        view.cancelThreshold = cancelThreshold
+        view.onPressStart = { touchStartedAt in
+            onPressStart(touchStartedAt)
+        }
+        view.onCancelStateChange = { [weak view] shouldCancel in
+            guard view?.isTouchInProgress == true || isPressing || isActive else { return }
+            onCancelStateChange(shouldCancel)
+        }
+        view.onEnterCancelZone = {
+            onEnterCancelZone()
+        }
+        view.onPressFinish = { [weak view] shouldCancel in
+            guard view?.isTouchInProgress == true || isPressing || isActive else {
+                return
+            }
+            if shouldCancel {
+                onPressCancel()
+            } else {
+                onPressEnd()
+            }
+        }
+        view.apply(
+            isActive: isActive,
+            isStarting: isStarting,
+            isListening: isListening,
+            isPressing: isPressing,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing,
+            animated: false
+        )
+        return view
+    }
+
+    func updateUIView(_ view: HoldToSpeakUIView, context: Context) {
+	        view.cancelThreshold = cancelThreshold
+	        view.acceptsNewTouches = !isStarting && !isFinalizing
+        view.onPressStart = { touchStartedAt in
+            onPressStart(touchStartedAt)
+        }
+        view.onCancelStateChange = { [weak view] shouldCancel in
+            guard view?.isTouchInProgress == true || isPressing || isActive else { return }
+            onCancelStateChange(shouldCancel)
+        }
+        view.onEnterCancelZone = {
+            onEnterCancelZone()
+        }
+        view.onPressFinish = { [weak view] shouldCancel in
+            guard view?.isTouchInProgress == true || isPressing || isActive else {
+                return
+            }
+            if shouldCancel {
+                onPressCancel()
+            } else {
+                onPressEnd()
+            }
+        }
+        view.apply(
+            isActive: isActive,
+            isStarting: isStarting,
+            isListening: isListening,
+            isPressing: isPressing,
+            isCanceling: isCanceling,
+            isFinalizing: isFinalizing,
+            animated: true
+        )
+        if !isActive, !isStarting, !isListening, !isPressing, !isFinalizing {
+            view.prepareForNextPress()
+        }
+    }
+}
+
+private final class HoldToSpeakUIView: UIControl {
+    private struct VisualState: Equatable {
+        var fillColor: UIColor
+        var strokeColor: UIColor
+        var title: String
+        var titleColor: UIColor
+        var usesFilledIcon: Bool
+        var isPressed: Bool
+    }
+
+    var cancelThreshold: CGFloat = -54
+    var acceptsNewTouches = true
+    var onPressStart: ((CFTimeInterval) -> Bool)?
+    var onCancelStateChange: ((Bool) -> Void)?
+    var onEnterCancelZone: (() -> Void)?
+    var onPressFinish: ((Bool) -> Void)?
+
+    private let backgroundLayer = CAShapeLayer()
+    private let strokeLayer = CAShapeLayer()
+    private let iconView = UIImageView()
+    private let titleLabel = UILabel()
+    private let pressImpact = UIImpactFeedbackGenerator(style: .soft)
+    private let micImage = UIImage(systemName: "mic")
+    private let micFillImage = UIImage(systemName: "mic.fill")
+    private var isTouching = false
+    private var didEnterCancelZone = false
+    private var didTriggerCancelZoneHaptic = false
+    private var startPoint: CGPoint = .zero
+    private var currentIconImage: UIImage?
+    private var lastVisualState: VisualState?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: 34)
+    }
+
+    func prepareForNextPress() {
+        pressImpact.prepare()
+    }
+
+    var isTouchInProgress: Bool {
+        isTouching
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let path = UIBezierPath(roundedRect: bounds, cornerRadius: bounds.height / 2).cgPath
+        backgroundLayer.path = path
+        strokeLayer.path = path
+
+        let labelSize = titleLabel.sizeThatFits(CGSize(width: max(bounds.width - 72, 0), height: bounds.height))
+        let iconSize: CGFloat = 16
+        let spacing: CGFloat = 6
+        let totalWidth = min(bounds.width - 20, iconSize + spacing + labelSize.width)
+        let startX = (bounds.width - totalWidth) / 2
+        let centerY = bounds.midY
+
+        iconView.frame = CGRect(x: startX, y: centerY - iconSize / 2, width: iconSize, height: iconSize)
+        titleLabel.frame = CGRect(
+            x: startX + iconSize + spacing,
+            y: 0,
+            width: min(labelSize.width, max(bounds.width - startX - iconSize - spacing - 10, 0)),
+            height: bounds.height
+        )
+    }
+
+    func apply(
+        isActive: Bool,
+        isStarting: Bool,
+        isListening: Bool,
+        isPressing: Bool,
+        isCanceling: Bool,
+        isFinalizing: Bool,
+        animated: Bool
+    ) {
+        let visualPressing = isTouching || isPressing
+        let title: String
+        if isStarting {
+            title = "启动中"
+        } else if isFinalizing {
+            title = "正在收尾"
+        } else if isCanceling || didEnterCancelZone {
+            title = "松开取消"
+        } else if isListening || visualPressing {
+            title = "按住说话中"
+        } else {
+            title = "按住 说话"
+        }
+
+        let fillColor: UIColor
+        let strokeColor: UIColor
+        let titleColor: UIColor
+        if isCanceling || didEnterCancelZone {
+            fillColor = .systemRed
+            strokeColor = UIColor.systemRed.withAlphaComponent(0.28)
+            titleColor = .white
+        } else if isListening || visualPressing || isFinalizing || isActive {
+            fillColor = UIColor(red: 0.20, green: 0.64, blue: 0.36, alpha: 1)
+            strokeColor = UIColor.systemGreen.withAlphaComponent(0.18)
+            titleColor = .white
+        } else {
+            fillColor = UIColor.secondarySystemFill.withAlphaComponent(0.72)
+            strokeColor = UIColor.label.withAlphaComponent(0.04)
+            titleColor = UIColor.label.withAlphaComponent(0.78)
+        }
+
+        applyVisualState(
+            VisualState(
+                fillColor: fillColor,
+                strokeColor: strokeColor,
+                title: title,
+                titleColor: titleColor,
+                usesFilledIcon: isListening || visualPressing,
+                isPressed: visualPressing
+            ),
+            animated: animated
+        )
+    }
+
+    private func setup() {
+        isMultipleTouchEnabled = false
+        backgroundColor = .clear
+        isOpaque = false
+
+        backgroundLayer.fillColor = UIColor.secondarySystemFill.withAlphaComponent(0.72).cgColor
+        layer.addSublayer(backgroundLayer)
+
+        strokeLayer.fillColor = UIColor.clear.cgColor
+        strokeLayer.strokeColor = UIColor.label.withAlphaComponent(0.04).cgColor
+        strokeLayer.lineWidth = 1
+        layer.addSublayer(strokeLayer)
+
+        iconView.contentMode = .scaleAspectFit
+        iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        addSubview(iconView)
+
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textAlignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        addSubview(titleLabel)
+
+        pressImpact.prepare()
+
+        apply(
+            isActive: false,
+            isStarting: false,
+            isListening: false,
+            isPressing: false,
+            isCanceling: false,
+            isFinalizing: false,
+            animated: false
+        )
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard acceptsNewTouches, !isTouching, let point = touches.first?.location(in: self) else { return }
+        let touchStartedAt = CACurrentMediaTime()
+        VoiceInputDiagnostics.timing("press-began", elapsedMilliseconds: 0)
+        isTouching = true
+        isUserInteractionEnabled = true
+        didEnterCancelZone = false
+        didTriggerCancelZoneHaptic = false
+        startPoint = point
+        applyInstantTouchFeedback(canceling: false)
+        pressImpact.impactOccurred(intensity: 0.75)
+        VoiceInputDiagnostics.timing("press-haptic-fired", elapsedMilliseconds: 0)
+        let didStart = onPressStart?(touchStartedAt) ?? true
+        guard didStart else {
+            resetTouchState()
+            apply(
+                isActive: false,
+                isStarting: false,
+                isListening: false,
+                isPressing: false,
+                isCanceling: false,
+                isFinalizing: false,
+                animated: false
+            )
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isTouching else { return }
+            self.pressImpact.prepare()
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard isTouching, let point = touches.first?.location(in: self) else { return }
+        let offsetY = point.y - startPoint.y
+        let shouldCancel = didEnterCancelZone
+            ? offsetY < cancelThreshold + 18
+            : offsetY < cancelThreshold
+        guard shouldCancel != didEnterCancelZone else { return }
+        didEnterCancelZone = shouldCancel
+        applyInstantTouchFeedback(canceling: shouldCancel)
+        onCancelStateChange?(shouldCancel)
+        if shouldCancel, !didTriggerCancelZoneHaptic {
+            didTriggerCancelZoneHaptic = true
+            onEnterCancelZone?()
+        } else if !shouldCancel {
+            didTriggerCancelZoneHaptic = false
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard isTouching else { return }
+        let point = touches.first?.location(in: self) ?? startPoint
+        let shouldCancel = didEnterCancelZone || point.y - startPoint.y < cancelThreshold
+        onPressFinish?(shouldCancel)
+        resetTouchState()
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard isTouching else { return }
+        onPressFinish?(true)
+        resetTouchState()
+    }
+
+    private func applyInstantTouchFeedback(canceling: Bool) {
+        applyVisualState(
+            VisualState(
+                fillColor: canceling ? .systemRed : UIColor(red: 0.20, green: 0.64, blue: 0.36, alpha: 1),
+                strokeColor: canceling ? UIColor.systemRed.withAlphaComponent(0.28) : UIColor.systemGreen.withAlphaComponent(0.18),
+                title: canceling ? "松开取消" : "按住说话中",
+                titleColor: .white,
+                usesFilledIcon: true,
+                isPressed: true
+            ),
+            animated: false
+        )
+    }
+
+    private func applyVisualState(_ state: VisualState, animated: Bool) {
+        guard lastVisualState != state else { return }
+        lastVisualState = state
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(!animated)
+        backgroundLayer.fillColor = state.fillColor.cgColor
+        strokeLayer.strokeColor = state.strokeColor.cgColor
+        CATransaction.commit()
+
+        titleLabel.text = state.title
+        titleLabel.textColor = state.titleColor
+	        iconView.tintColor = state.titleColor
+	        setIconImage(state.usesFilledIcon ? micFillImage : micImage)
+	        updateScale(pressed: state.isPressed, animated: animated && !state.isPressed)
+	        setNeedsLayout()
+	    }
+
+    private func setIconImage(_ image: UIImage?) {
+        guard currentIconImage !== image else { return }
+        currentIconImage = image
+        iconView.image = image
+    }
+
+    private func resetTouchState() {
+        isTouching = false
+	        didEnterCancelZone = false
+	        didTriggerCancelZoneHaptic = false
+	        startPoint = .zero
+	        updateScale(pressed: false, animated: true)
+	    }
+
+	    private func updateScale(pressed: Bool, animated: Bool) {
+	        let target = pressed ? CGAffineTransform(scaleX: 0.985, y: 0.985) : .identity
+	        guard transform != target else { return }
+	        guard animated else {
+	            transform = target
+	            return
+	        }
+	        UIView.animate(
+	            withDuration: 0.08,
+            delay: 0,
+            options: [.allowUserInteraction, .beginFromCurrentState, .curveEaseOut]
+        ) {
+            self.transform = target
+        }
+    }
+}
+
+private struct AutoScrollingTextView: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var measuredHeight: CGFloat
+    let minLines: Int
+    let maxLines: Int
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = SizingTextView()
+        textView.delegate = context.coordinator
+        textView.onLayout = { textView in
+            context.coordinator.recalculateHeight(for: textView)
+        }
+        textView.backgroundColor = .clear
+        textView.font = .systemFont(ofSize: 16)
+        textView.textColor = .label
+        textView.tintColor = .tintColor
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.isScrollEnabled = true
+        textView.showsVerticalScrollIndicator = false
+        textView.keyboardDismissMode = .interactive
+        textView.returnKeyType = .default
+        textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.parent = self
+
+        if textView.text != text {
+            textView.text = text
+            context.coordinator.recalculateHeight(for: textView)
+            textView.scrollToComposerEnd(animated: false)
+            let coordinator = context.coordinator
+            DispatchQueue.main.async {
+                coordinator.recalculateHeight(for: textView)
+                textView.scrollToComposerEnd(animated: false)
+            }
+        } else {
+            context.coordinator.recalculateHeight(for: textView)
+            let coordinator = context.coordinator
+            DispatchQueue.main.async {
+                coordinator.recalculateHeight(for: textView)
+            }
+        }
+
+        // Let UIKit own first-responder state. SwiftUI refreshes this screen often,
+        // and driving focus from updateUIView can immediately cancel a user tap.
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: AutoScrollingTextView
+
+        init(_ parent: AutoScrollingTextView) {
+            self.parent = parent
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text
+            recalculateHeight(for: textView)
+            textView.scrollCurrentSelectionIntoView(animated: false)
+            DispatchQueue.main.async {
+                textView.scrollCurrentSelectionIntoView(animated: false)
+            }
+        }
+
+        func recalculateHeight(for textView: UITextView) {
+            let width = textView.bounds.width
+            guard width > 0, let font = textView.font else { return }
+
+            let fittingSize = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            let contentHeight = ceil(textView.sizeThatFits(fittingSize).height)
+            let verticalSlack = max(6, font.descender.magnitude + 4)
+            let minHeight = ceil(font.lineHeight * CGFloat(max(parent.minLines, 1)) + verticalSlack)
+            let maxHeight = ceil(font.lineHeight * CGFloat(max(parent.maxLines, parent.minLines)) + verticalSlack)
+            let nextHeight = min(max(contentHeight, minHeight), maxHeight)
+
+            guard abs(parent.measuredHeight - nextHeight) > 0.5 else { return }
+
+            DispatchQueue.main.async {
+                self.parent.measuredHeight = nextHeight
+            }
+        }
+    }
+
+    final class SizingTextView: UITextView {
+        var onLayout: ((UITextView) -> Void)?
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            onLayout?(self)
+        }
+    }
+}
+
+private extension UITextView {
+    func scrollToComposerEnd(animated: Bool) {
+        guard !text.isEmpty else {
+            setContentOffset(.zero, animated: false)
+            return
+        }
+
+        let end = NSRange(location: (text as NSString).length, length: 0)
+        selectedRange = end
+        scrollRangeToVisible(end)
+    }
+
+    func scrollCurrentSelectionIntoView(animated: Bool) {
+        guard !text.isEmpty else {
+            setContentOffset(.zero, animated: false)
+            return
+        }
+
+        scrollRangeToVisible(selectedRange)
+    }
+}
+
+// MARK: - Pane Info View
+
+private struct PaneInfoView: View {
+    let pane: Pane
+
+    var body: some View {
+        List {
+            Section("Status") {
+                HStack {
+                    Text("State")
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle().fill(statusColor(pane.status)).frame(width: 8, height: 8)
+                        Text(pane.status.title)
+                    }
+                    .foregroundColor(statusColor(pane.status))
+                }
+                HStack {
+                    Text("Reason")
+                    Spacer()
+                    Text(pane.reason).foregroundColor(.secondary)
+                }
+                HStack {
+                    Text("Updated")
+                    Spacer()
+                    Text(pane.updatedAt, style: .time).foregroundColor(.secondary)
+                }
+            }
+
+            Section("Session") {
+                InfoRow(label: "Session", value: pane.session)
+                InfoRow(label: "Command", value: pane.command.isEmpty ? "shell" : pane.command)
+                InfoRow(label: "Pane ID", value: pane.id)
+                InfoRow(label: "Target", value: pane.target)
+                if let pid = pane.pid {
+                    InfoRow(label: "PID", value: String(pid))
+                }
+            }
+
+            Section("Path") {
+                Text(pane.path)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+private struct InfoRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+            Spacer()
+            Text(value)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+        }
     }
 }

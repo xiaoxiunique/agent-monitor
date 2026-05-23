@@ -19,25 +19,39 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
-		<key>NSAllowsArbitraryLoadsInWebContent</key>
-		<true/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Agent Monitor connects to the local Mac service on your LAN or Tailscale network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Agent Monitor uses the microphone to turn your voice into text before sending it to the agent.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Agent Monitor lets you choose images to send to the agent running on your Mac.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Agent Monitor uses speech recognition to transcribe voice input into the message field.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
 	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>
-		<string></string>
+		<string>LaunchBackground</string>
 	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
 </dict>
 </plist>

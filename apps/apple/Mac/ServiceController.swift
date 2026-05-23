@@ -47,31 +47,40 @@ final class ServiceController {
         .deletingLastPathComponent()
 
     private let bundledServiceExecutable = Bundle.main.resourceURL?.appendingPathComponent("agent-monitor-service")
-    private let bundledPublicDirectory = Bundle.main.resourceURL?.appendingPathComponent("public")
     private let developmentServiceExecutable = ServiceController.projectRoot.appendingPathComponent("AgentMonitorService/target/release/agent-monitor-service")
-    private let developmentPublicDirectory = ServiceController.monorepoRoot.appendingPathComponent("public")
     private let port = 8787
     private var process: Process?
     private var monitorTask: Task<Void, Never>?
+    private var shouldKeepServiceAvailable = true
+    private var terminationObserver: NSObjectProtocol?
 
     init() {
         tailscaleHost = Self.currentTailscaleAddress()
         lanHost = Self.currentLANAddress()
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.stopOwnedService()
+            }
+        }
         Task { @MainActor [weak self] in
             await self?.startIfNeeded()
         }
     }
 
-    var dashboardURL: URL {
+    var localServiceURL: URL {
         URL(string: "http://127.0.0.1:\(port)/")!
     }
 
-    var phoneDashboardURL: URL {
+    var phoneServiceURL: URL {
         let host = tailscaleHost ?? lanHost ?? Self.currentTailscaleAddress() ?? Self.currentLANAddress() ?? "127.0.0.1"
         return URL(string: "http://\(host):\(port)/")!
     }
 
-    var lanDashboardURL: URL? {
+    var lanServiceURL: URL? {
         guard let lanHost else { return nil }
         return URL(string: "http://\(lanHost):\(port)/")
     }
@@ -101,19 +110,12 @@ final class ServiceController {
         return developmentServiceExecutable
     }
 
-    private var publicDirectory: URL {
-        if let bundledPublicDirectory,
-           FileManager.default.fileExists(atPath: bundledPublicDirectory.appendingPathComponent("index.html").path) {
-            return bundledPublicDirectory
-        }
-
-        return developmentPublicDirectory
-    }
-
     func startIfNeeded() async {
+        shouldKeepServiceAvailable = true
         await refreshStatus()
-        guard !isReachable else {
+        if isReachable {
             state = .runningExternal
+            startMonitorLoop()
             return
         }
         await startOwnedService()
@@ -136,8 +138,17 @@ final class ServiceController {
     }
 
     func startOwnedService() async {
+        await startOwnedService(ensureMonitorLoop: true)
+    }
+
+    private func startOwnedService(ensureMonitorLoop: Bool) async {
+        shouldKeepServiceAvailable = true
+
         guard process?.isRunning != true else {
             await refreshStatus()
+            if ensureMonitorLoop {
+                startMonitorLoop()
+            }
             return
         }
 
@@ -145,6 +156,9 @@ final class ServiceController {
             isReachable = true
             state = .runningExternal
             lastMessage = "Existing service detected on port \(port)."
+            if ensureMonitorLoop {
+                startMonitorLoop()
+            }
             return
         }
 
@@ -154,12 +168,6 @@ final class ServiceController {
         guard FileManager.default.isExecutableFile(atPath: serviceExecutable.path) else {
             state = .failed
             lastMessage = "Missing agent-monitor-service at \(serviceExecutable.path)."
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: publicDirectory.appendingPathComponent("index.html").path) else {
-            state = .failed
-            lastMessage = "Missing web assets at \(publicDirectory.path)."
             return
         }
 
@@ -176,7 +184,6 @@ final class ServiceController {
         }
         environment["AGENT_MONITOR_HOST"] = "0.0.0.0"
         environment["AGENT_MONITOR_PORT"] = String(port)
-        environment["AGENT_MONITOR_PUBLIC_DIR"] = publicDirectory.path
         environment.removeValue(forKey: "AGENT_MONITOR_TOKEN")
         process.environment = environment
 
@@ -204,7 +211,9 @@ final class ServiceController {
         do {
             try process.run()
             self.process = process
-            startMonitorLoop()
+            if ensureMonitorLoop {
+                startMonitorLoop()
+            }
         } catch {
             state = .failed
             lastMessage = error.localizedDescription
@@ -212,12 +221,23 @@ final class ServiceController {
     }
 
     func restartOwnedService() async {
-        stopOwnedService()
+        monitorTask?.cancel()
+        monitorTask = nil
+        if let pipe = process?.standardOutput as? Pipe {
+            pipe.fileHandleForReading.readabilityHandler = nil
+        }
+        process?.terminate()
+        process = nil
+        isReachable = false
+        state = .idle
+        lastMessage = "Restarting service..."
+        shouldKeepServiceAvailable = true
         try? await Task.sleep(for: .milliseconds(400))
         await startOwnedService()
     }
 
     func stopOwnedService() {
+        shouldKeepServiceAvailable = false
         monitorTask?.cancel()
         monitorTask = nil
         if let pipe = process?.standardOutput as? Pipe {
@@ -230,26 +250,32 @@ final class ServiceController {
         lastMessage = "Owned service stopped."
     }
 
-    func openDashboard() {
-        NSWorkspace.shared.open(dashboardURL)
+    func openServiceSnapshot() {
+        NSWorkspace.shared.open(localServiceURL.appendingPathComponent("api/snapshot"))
     }
 
-    func copyPhoneDashboardURL() {
+    func copyPhoneServiceURL() {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(phoneDashboardURL.absoluteString, forType: .string)
-        lastMessage = "Copied \(phoneURLKind) URL: \(phoneDashboardURL.absoluteString)"
+        NSPasteboard.general.setString(phoneServiceURL.absoluteString, forType: .string)
+        lastMessage = "Copied \(phoneURLKind) URL: \(phoneServiceURL.absoluteString)"
     }
 
     func revealServiceFolder() {
-        NSWorkspace.shared.activateFileViewerSelecting([serviceExecutable, publicDirectory])
+        NSWorkspace.shared.activateFileViewerSelecting([serviceExecutable])
     }
 
     private func startMonitorLoop() {
+        guard monitorTask == nil else { return }
         monitorTask?.cancel()
         monitorTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 await self.refreshStatus()
+                if self.shouldKeepServiceAvailable,
+                   !self.isReachable,
+                   self.process?.isRunning != true {
+                    await self.startOwnedService(ensureMonitorLoop: false)
+                }
                 try? await Task.sleep(for: .seconds(2))
             }
         }

@@ -1,0 +1,20 @@
+PODS:
+  - QCloudRealTime (3.1.36):
+    - VoiceCommon
+  - VoiceCommon (1.0.5)
+
+DEPENDENCIES:
+  - QCloudRealTime (~> 3.1.36)
+
+SPEC REPOS:
+  trunk:
+    - QCloudRealTime
+    - VoiceCommon
+
+SPEC CHECKSUMS:
+  QCloudRealTime: 0716f5b9b48bc8e34075fc5f40fd1a4410d26f4b
+  VoiceCommon: 9173989ada4b13bea37cb6719b371597cdda4ee9
+
+PODFILE CHECKSUM: 19c4b6b90ad0df0b8c2a8dd3f073f8a032d8abbf
+
+COCOAPODS: 1.16.2

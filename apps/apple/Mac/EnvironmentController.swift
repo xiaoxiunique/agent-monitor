@@ -115,8 +115,8 @@ final class EnvironmentController {
         let diagnostics = """
         Agent Monitor Diagnostics
         Service: \(service.state.title)
-        Local URL: \(service.dashboardURL.absoluteString)
-        Phone URL: \(service.phoneDashboardURL.absoluteString)
+        Local URL: \(service.localServiceURL.absoluteString)
+        Phone URL: \(service.phoneServiceURL.absoluteString)
         Tailscale: \(service.tailscaleHost ?? "none")
         LAN: \(service.lanHost ?? "none")
         tmux: \(tmuxVersion ?? "missing")

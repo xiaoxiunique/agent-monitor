@@ -98,25 +98,25 @@ private struct ServiceStatusSection: View {
                 isGood: service.isReachable
             )
 
-            CopyRow(title: "Local", value: service.dashboardURL.absoluteString)
-            CopyRow(title: service.phoneURLKind, value: service.phoneDashboardURL.absoluteString)
+            CopyRow(title: "Local", value: service.localServiceURL.absoluteString)
+            CopyRow(title: service.phoneURLKind, value: service.phoneServiceURL.absoluteString)
 
-            if let lanDashboardURL = service.lanDashboardURL, service.tailscaleHost != nil {
-                CopyRow(title: "LAN", value: lanDashboardURL.absoluteString)
+            if let lanServiceURL = service.lanServiceURL, service.tailscaleHost != nil {
+                CopyRow(title: "LAN", value: lanServiceURL.absoluteString)
             }
 
             HStack {
                 Button {
-                    service.openDashboard()
+                    service.openServiceSnapshot()
                 } label: {
-                    Label("Open Dashboard", systemImage: "safari")
+                    Label("Open Snapshot API", systemImage: "safari")
                 }
                 .disabled(!service.isReachable)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
 
                 Button {
-                    service.copyPhoneDashboardURL()
+                    service.copyPhoneServiceURL()
                 } label: {
                     Label("Copy Phone URL", systemImage: "doc.on.doc")
                 }

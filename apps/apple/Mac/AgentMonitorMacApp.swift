@@ -27,13 +27,13 @@ private struct AgentMonitorMenu: View {
 
     var body: some View {
         Text(service.statusTitle)
-        Text(service.dashboardURL.absoluteString)
+        Text(service.localServiceURL.absoluteString)
             .font(.caption)
-        Text("\(service.phoneURLKind): \(service.phoneDashboardURL.absoluteString)")
+        Text("\(service.phoneURLKind): \(service.phoneServiceURL.absoluteString)")
             .font(.caption)
 
-        if let lanDashboardURL = service.lanDashboardURL, service.tailscaleHost != nil {
-            Text("LAN: \(lanDashboardURL.absoluteString)")
+        if let lanServiceURL = service.lanServiceURL, service.tailscaleHost != nil {
+            Text("LAN: \(lanServiceURL.absoluteString)")
                 .font(.caption)
         }
 
@@ -50,13 +50,13 @@ private struct AgentMonitorMenu: View {
             openWindow(id: "control-center")
         }
 
-        Button("Open Dashboard") {
-            service.openDashboard()
+        Button("Open Snapshot API") {
+            service.openServiceSnapshot()
         }
         .disabled(!service.isReachable)
 
         Button("Copy Phone URL") {
-            service.copyPhoneDashboardURL()
+            service.copyPhoneServiceURL()
         }
 
         Button("Start Service") {

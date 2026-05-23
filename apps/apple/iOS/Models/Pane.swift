@@ -20,6 +20,58 @@ enum PaneStatus: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum InteractionMessageRole: String, Codable, Equatable {
+    case agent
+    case user
+    case system
+}
+
+enum InteractionMessageKind: String, Codable, Equatable {
+    case summary
+    case status
+    case question
+    case permissionRequest = "permission_request"
+    case progress
+    case error
+    case done
+    case notification
+}
+
+enum InteractionMessagePriority: String, Codable, Equatable {
+    case low
+    case normal
+    case high
+}
+
+enum InteractionActionStyle: String, Codable, Equatable {
+    case `default`
+    case destructive
+}
+
+struct InteractionAction: Codable, Equatable {
+    let label: String
+    let payload: String
+    let style: InteractionActionStyle?
+}
+
+struct InteractionSource: Codable, Equatable {
+    let type: String
+    let excerpt: String
+}
+
+struct InteractionMessage: Codable, Identifiable, Equatable {
+    let id: String
+    let paneId: String
+    let role: InteractionMessageRole
+    let kind: InteractionMessageKind
+    let priority: InteractionMessagePriority
+    let title: String
+    let body: String
+    let actions: [InteractionAction]?
+    let source: InteractionSource?
+    let createdAt: Date
+}
+
 struct Pane: Codable, Identifiable, Equatable {
     let id: String
     let target: String
@@ -36,6 +88,7 @@ struct Pane: Codable, Identifiable, Equatable {
     let status: PaneStatus
     let reason: String
     let updatedAt: Date
+    let messages: [InteractionMessage]?
 
     var displayName: String {
         "\(session) / \(windowName.isEmpty ? windowIndex : windowName)"
@@ -44,6 +97,15 @@ struct Pane: Codable, Identifiable, Equatable {
     var recentLines: String {
         let lines = tail.split(separator: "\n", omittingEmptySubsequences: false)
         return lines.suffix(5).joined(separator: "\n")
+    }
+
+    var isCodexPane: Bool {
+        let haystack = "\(session)\n\(command)\n\(title)\n\(tail)".lowercased()
+        return session.hasPrefix("cx_") || haystack.contains("codex")
+    }
+
+    var sendSubmitKey: String {
+        isCodexPane ? "Tab" : "Enter"
     }
 }
 

@@ -1,12 +1,15 @@
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    fs,
     io::{Read, Write},
     net::SocketAddr,
-    path::{Component, Path, PathBuf},
+    path::PathBuf,
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{LazyLock, Mutex},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -15,13 +18,12 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{header, HeaderMap, Method, Request, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use percent_encoding::percent_decode_str;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,12 +34,99 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const FIELD_SEPARATOR: &str = "\t";
 
 static BUFFER_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PANE_ACTIVITY: LazyLock<Mutex<HashMap<String, PaneActivity>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static MESSAGE_CACHE: LazyLock<Mutex<HashMap<String, Vec<InteractionMessage>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PENDING_INTERPRETATIONS: LazyLock<Mutex<HashMap<String, ()>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PANE_LOG_REFRESH_BURST_IDS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PANE_LOG_REFRESH_BURST_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SNAPSHOT_REFRESH_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PANE_LOG_REFRESH_BURST_DELAYS_MS: &[u64] = &[0, 80, 180, 360, 700, 1200, 2200, 3800];
+const PANE_COMMAND_TAIL_SETTLE_DELAYS_MS: &[u64] = &[0, 80, 180, 360, 700];
+const PANE_COMMAND_TAIL_LINE_COUNT: usize = 800;
+
+struct PaneActivity {
+    tail_hash: u64,
+    changed_at: Instant,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+enum InteractionRole {
+    Agent,
+    User,
+    System,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+enum InteractionKind {
+    Summary,
+    Status,
+    Question,
+    PermissionRequest,
+    Progress,
+    Error,
+    Done,
+    Notification,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+enum InteractionPriority {
+    Low,
+    Normal,
+    High,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+enum InteractionActionStyle {
+    Default,
+    Destructive,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct InteractionAction {
+    label: String,
+    payload: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    style: Option<InteractionActionStyle>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct InteractionSource {
+    #[serde(rename = "type")]
+    source_type: String,
+    excerpt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct InteractionMessage {
+    id: String,
+    pane_id: String,
+    role: InteractionRole,
+    kind: InteractionKind,
+    priority: InteractionPriority,
+    title: String,
+    body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actions: Option<Vec<InteractionAction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<InteractionSource>,
+    created_at: String,
+}
 
 #[derive(Clone)]
 struct AppState {
     token: String,
-    public_dir: PathBuf,
     snapshots: broadcast::Sender<serde_json::Value>,
+    pane_log_refreshes: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -68,6 +157,7 @@ struct Pane {
     status: PaneStatus,
     reason: String,
     updated_at: String,
+    messages: Vec<InteractionMessage>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -79,7 +169,7 @@ struct Snapshot {
     error: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BasePane {
     id: String,
     target: String,
@@ -105,12 +195,20 @@ struct SendRequest {
     pane_id: String,
     text: String,
     enter: Option<bool>,
+    submit_key: Option<String>,
     vim_mode: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
+struct RefineTextRequest {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct KillSessionRequest {
-    session: String,
+    pane_id: Option<String>,
+    session: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,26 +233,28 @@ async fn main() {
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
     let token = env::var("AGENT_MONITOR_TOKEN").unwrap_or_default();
-    let public_dir = public_dir();
-    let public_urls = env::var("AGENT_MONITOR_PUBLIC_URLS").unwrap_or_default();
     let (snapshots, _) = broadcast::channel(32);
+    let (pane_log_refreshes, _) = broadcast::channel(128);
 
     let state = AppState {
         token,
-        public_dir,
         snapshots,
+        pane_log_refreshes,
     };
 
     spawn_snapshot_loop(state.clone());
 
     let app = Router::new()
         .route("/api/snapshot", get(api_snapshot))
+        .route("/api/pane/context", get(api_pane_context))
         .route("/api/send", post(api_send))
+        .route("/api/refine-text", post(api_refine_text))
+        .route("/api/upload-image", post(api_upload_image))
         .route("/api/key", post(api_key))
         .route("/api/session/kill", post(api_kill_session))
         .route("/ws", get(snapshot_ws))
+        .route("/pane-log/ws", get(pane_log_ws))
         .route("/terminal/ws", get(terminal_ws))
-        .fallback(static_handler)
         .with_state(state.clone());
 
     let bind_addr = format!("{host}:{port}");
@@ -166,19 +266,7 @@ async fn main() {
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
 
     println!("Agent Monitor listening on http://{addr}");
-    let urls = public_urls
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .collect::<Vec<_>>();
-    if urls.is_empty() {
-        println!("Open: http://{host}:{port}/");
-    } else {
-        println!("Open:");
-        for url in urls {
-            println!("  {url}/");
-        }
-    }
+    println!("API: http://{host}:{port}/api/snapshot");
     if state.token.is_empty() {
         println!("Token auth is disabled. Set AGENT_MONITOR_TOKEN to require a token.");
     } else {
@@ -186,16 +274,6 @@ async fn main() {
     }
 
     axum::serve(listener, app).await.expect("server failed");
-}
-
-fn public_dir() -> PathBuf {
-    if let Ok(path) = env::var("AGENT_MONITOR_PUBLIC_DIR") {
-        return PathBuf::from(path);
-    }
-
-    env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("public")
 }
 
 fn now_iso() -> String {
@@ -297,17 +375,100 @@ fn list_panes() -> Result<Vec<BasePane>, String> {
 }
 
 fn capture_pane(pane_id: &str) -> String {
-    run_tmux(&[
+    capture_pane_lines(pane_id, 300)
+}
+
+fn capture_pane_lines(pane_id: &str, lines: usize) -> String {
+    let safe_lines = lines.clamp(50, 5000);
+    let primary = run_tmux(&[
         "capture-pane".to_string(),
         "-p".to_string(),
         "-J".to_string(),
         "-S".to_string(),
-        "-300".to_string(),
+        format!("-{safe_lines}"),
+        "-t".to_string(),
+        pane_id.to_string(),
+    ])
+    .map(|output| output.stdout.trim_end().to_string())
+    .unwrap_or_default();
+    if !primary.trim().is_empty() {
+        return primary;
+    }
+
+    run_tmux(&[
+        "capture-pane".to_string(),
+        "-p".to_string(),
+        "-a".to_string(),
+        "-q".to_string(),
+        "-J".to_string(),
+        "-S".to_string(),
+        format!("-{safe_lines}"),
         "-t".to_string(),
         pane_id.to_string(),
     ])
     .map(|output| output.stdout.trim_end().to_string())
     .unwrap_or_default()
+}
+
+fn context_line_count(value: Option<&String>) -> usize {
+    value
+        .and_then(|item| item.parse::<usize>().ok())
+        .unwrap_or(1200)
+        .clamp(100, 5000)
+}
+
+fn pane_log_line_count(value: Option<&String>) -> usize {
+    value
+        .and_then(|item| item.parse::<usize>().ok())
+        .unwrap_or(300)
+        .clamp(50, 1000)
+}
+
+fn detect_image_upload(image: &[u8]) -> Option<(&'static str, &'static str)> {
+    if image.len() >= 3 && image[0] == 0xff && image[1] == 0xd8 && image[2] == 0xff {
+        return Some((".jpg", "image/jpeg"));
+    }
+
+    if image.len() >= 8
+        && image[0] == 0x89
+        && image[1] == 0x50
+        && image[2] == 0x4e
+        && image[3] == 0x47
+        && image[4] == 0x0d
+        && image[5] == 0x0a
+        && image[6] == 0x1a
+        && image[7] == 0x0a
+    {
+        return Some((".png", "image/png"));
+    }
+
+    None
+}
+
+fn safe_upload_pane_name(pane_id: &str) -> String {
+    let safe = pane_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
+fn upload_output_dir() -> PathBuf {
+    env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("output")
+        .join("mobile-uploads")
 }
 
 fn paste_text(pane_id: &str, text: &str) -> Result<(), String> {
@@ -343,7 +504,20 @@ fn paste_text(pane_id: &str, text: &str) -> Result<(), String> {
     paste.map(|_| ())
 }
 
-fn infer_status(pane: &BasePane, tail: &str) -> (PaneStatus, String) {
+fn is_codex_pane(pane: &BasePane, tail: &str) -> bool {
+    let haystack = format!(
+        "{}\n{}\n{}\n{}",
+        pane.session, pane.command, pane.title, tail
+    )
+    .to_lowercase();
+
+    pane.session.starts_with("cx_")
+        || pane.command == "codex"
+        || haystack.contains("codex")
+        || haystack.contains("gpt-")
+}
+
+fn infer_status(pane: &BasePane, tail: &str, changed_recently: bool) -> (PaneStatus, String) {
     let lower = tail.to_lowercase();
     let recent = tail
         .lines()
@@ -413,12 +587,29 @@ fn infer_status(pane: &BasePane, tail: &str) -> (PaneStatus, String) {
         return (PaneStatus::Done, "recent output looks complete".to_string());
     }
 
-    if [
-        "claude", "codex", "node", "bun", "npm", "pnpm", "yarn", "zig", "cargo", "python",
-    ]
-    .contains(&pane.command.as_str())
-    {
-        return (PaneStatus::Running, format!("{} is active", pane.command));
+    let agent_haystack = format!("{}\n{}\n{}", pane.session, pane.title, tail).to_lowercase();
+    let agent_like = pane.command == "claude"
+        || agent_haystack.contains("claude")
+        || is_codex_pane(pane, tail);
+    let live_agent_work = contains_any(&recent, &["esc to interrupt", "/stop to close"])
+        && contains_any(&recent, &["working (", "thinking (", "running ("]);
+
+    if agent_like && live_agent_work {
+        return (
+            PaneStatus::Running,
+            "agent reports active work".to_string(),
+        );
+    }
+
+    if changed_recently {
+        return (PaneStatus::Running, "recent output changed".to_string());
+    }
+
+    if agent_like {
+        return (
+            PaneStatus::Idle,
+            "agent pane has no recent output".to_string(),
+        );
     }
 
     if lower.is_empty() || ["zsh", "bash", "fish", "nu"].contains(&pane.command.as_str()) {
@@ -442,6 +633,862 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
 }
 
+fn strip_terminal_noise(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn tail_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn activity_fingerprint(tail: &str) -> String {
+    tail.lines()
+        .map(strip_terminal_noise)
+        .map(|line| {
+            line.replace(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], "")
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.chars().all(|ch| "╭╮╰╯│─ ".contains(ch)))
+        .filter(|line| !line.to_lowercase().starts_with("─ worked for"))
+        .filter(|line| !line.starts_with('›'))
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            !lower.contains("context ") || !lower.contains("% used")
+        })
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            !(contains_any(&lower, &["working (", "thinking (", "running ("])
+                && contains_any(&lower, &["esc to interrupt", "/stop to close"]))
+        })
+        .rev()
+        .take(24)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clean_task_title(value: &str) -> String {
+    strip_terminal_noise(value)
+        .trim_start_matches(|ch: char| {
+            ch.is_whitespace()
+                || ch == '✳'
+                || ('\u{2800}'..='\u{28ff}').contains(&ch)
+        })
+        .trim()
+        .to_string()
+}
+
+fn meaningful_tail_lines(tail: &str, count: usize) -> Vec<String> {
+    tail.lines()
+        .map(strip_terminal_noise)
+        .map(|line| {
+            line.replace(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], "")
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.chars().all(|ch| "╭╮╰╯│─━═— ".contains(ch)))
+        .filter(|line| !line.starts_with("--"))
+        .filter(|line| !line.starts_with('›'))
+        .rev()
+        .take(count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn interaction_source(lines: &[String]) -> Option<InteractionSource> {
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(InteractionSource {
+        source_type: "log".to_string(),
+        excerpt: lines
+            .iter()
+            .rev()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
+}
+
+fn summarize_recent_work(tail: &str) -> String {
+    let mut lines = meaningful_tail_lines(tail, 32)
+        .into_iter()
+        .fold(Vec::<String>::new(), |mut acc, line| {
+            if acc.last() != Some(&line) {
+                acc.push(line);
+            }
+            acc
+        })
+        .into_iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            contains_any(
+                &lower,
+                &[
+                    "succeeded",
+                    "passed",
+                    "finished",
+                    "completed",
+                    "done",
+                    "fixed",
+                    "updated",
+                    "created",
+                    "generated",
+                    "built",
+                    "compiled",
+                    "checked",
+                    "installed",
+                    "launched",
+                    "failed",
+                    "error",
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if lines.len() > 4 {
+        lines = lines.split_off(lines.len() - 4);
+    }
+
+    if lines.is_empty() {
+        let recent = meaningful_tail_lines(tail, 4)
+            .into_iter()
+            .fold(Vec::<String>::new(), |mut acc, line| {
+                if acc.last() != Some(&line) {
+                    acc.push(line);
+                }
+                acc
+            });
+        if recent.is_empty() {
+            return "No recent work has been captured yet.".to_string();
+        }
+        return recent
+            .into_iter()
+            .map(|line| format!("- {}", limit_string(&line, 150)))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    let lines = lines
+        .into_iter()
+        .map(|line| {
+            if line.chars().count() > 140 {
+                format!("{}...", limit_string(&line, 137))
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+
+    lines
+        .into_iter()
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn phase_feedback_message(
+    pane: &BasePane,
+    lines: &[String],
+    status: &PaneStatus,
+    reason: &str,
+    now: &str,
+    fingerprint: u64,
+    source: Option<InteractionSource>,
+) -> InteractionMessage {
+    let last_line = lines.last().cloned();
+    let mut message = InteractionMessage {
+        id: format!("{}:feedback:{}:{fingerprint}", pane.id, pane_status_key(status)),
+        pane_id: pane.id.clone(),
+        role: InteractionRole::Agent,
+        kind: InteractionKind::Notification,
+        priority: InteractionPriority::Normal,
+        title: "Phase feedback".to_string(),
+        body: last_line
+            .as_ref()
+            .map(|line| format!("Latest checkpoint: {line}"))
+            .unwrap_or_else(|| {
+                "The agent is still working. Feedback will update when the next checkpoint appears."
+                    .to_string()
+            }),
+        actions: None,
+        source,
+        created_at: now.to_string(),
+    };
+
+    match status {
+        PaneStatus::Running => {}
+        PaneStatus::Waiting => {
+            message.priority = InteractionPriority::High;
+            message.title = "Blocked".to_string();
+            message.body = "The agent is waiting for your reply before it can continue.".to_string();
+        }
+        PaneStatus::Failed => {
+            message.priority = InteractionPriority::High;
+            message.title = "Needs follow-up".to_string();
+            message.body = if reason.is_empty() {
+                last_line.unwrap_or_else(|| {
+                    "The last phase needs attention before work can continue.".to_string()
+                })
+            } else {
+                reason.to_string()
+            };
+        }
+        PaneStatus::Done => {
+            message.title = "Ready for next instruction".to_string();
+            message.body =
+                "Recent work appears complete. You can send a follow-up instruction below."
+                    .to_string();
+        }
+        PaneStatus::Idle => {
+            message.priority = InteractionPriority::Low;
+            message.title = "Ready".to_string();
+            message.body =
+                "No active work is running. Send a new instruction below when you want the agent to continue."
+                    .to_string();
+        }
+    }
+
+    message
+}
+
+fn local_interaction_messages(
+    pane: &BasePane,
+    tail: &str,
+    status: &PaneStatus,
+    reason: &str,
+    now: &str,
+) -> Vec<InteractionMessage> {
+    let lines = meaningful_tail_lines(tail, 10);
+    let source = interaction_source(&lines);
+    let fingerprint = tail_hash(&activity_fingerprint(tail));
+    let title = clean_task_title(&pane.title);
+    let history_message = InteractionMessage {
+        id: format!("{}:summary:{fingerprint}", pane.id),
+        pane_id: pane.id.clone(),
+        role: InteractionRole::Agent,
+        kind: InteractionKind::Summary,
+        priority: InteractionPriority::Low,
+        title: "Recent work".to_string(),
+        body: summarize_recent_work(tail),
+        actions: None,
+        source: source.clone(),
+        created_at: now.to_string(),
+    };
+    let mut message = InteractionMessage {
+        id: format!("{}:current:{}:{fingerprint}", pane.id, pane_status_key(status)),
+        pane_id: pane.id.clone(),
+        role: InteractionRole::Agent,
+        kind: InteractionKind::Status,
+        priority: InteractionPriority::Low,
+        title: "Idle".to_string(),
+        body: if reason.is_empty() {
+            "The agent is idle right now.".to_string()
+        } else {
+            reason.to_string()
+        },
+        actions: None,
+        source,
+        created_at: now.to_string(),
+    };
+
+    match status {
+        PaneStatus::Waiting => {
+            let prompt = lines
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "I need your input before I can continue.".to_string());
+            let lower = prompt.to_lowercase();
+            let is_permission = contains_any(
+                &lower,
+                &["allow", "approve", "permission", "continue", "proceed", "yes/no", "y/n"],
+            );
+            message.kind = if is_permission {
+                InteractionKind::PermissionRequest
+            } else {
+                InteractionKind::Question
+            };
+            message.priority = InteractionPriority::High;
+            message.title = if is_permission {
+                "Approval needed".to_string()
+            } else {
+                "Agent is asking".to_string()
+            };
+            message.body = prompt;
+            message.actions = Some(vec![
+                InteractionAction {
+                    label: "Yes".to_string(),
+                    payload: "yes".to_string(),
+                    style: Some(InteractionActionStyle::Default),
+                },
+                InteractionAction {
+                    label: "No".to_string(),
+                    payload: "no".to_string(),
+                    style: Some(InteractionActionStyle::Destructive),
+                },
+                InteractionAction {
+                    label: "Continue".to_string(),
+                    payload: "继续".to_string(),
+                    style: Some(InteractionActionStyle::Default),
+                },
+            ]);
+        }
+        PaneStatus::Running => {
+            message.kind = InteractionKind::Progress;
+            message.priority = InteractionPriority::Normal;
+            message.title = "Working".to_string();
+            message.body = if title.is_empty() {
+                if reason.is_empty() {
+                    "Working on the current task.".to_string()
+                } else {
+                    reason.to_string()
+                }
+            } else {
+                format!("Working on {title}.")
+            };
+        }
+        PaneStatus::Failed => {
+            message.kind = InteractionKind::Error;
+            message.priority = InteractionPriority::High;
+            message.title = "Needs attention".to_string();
+            message.body = if reason.is_empty() {
+                lines
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "The agent appears to have hit an error.".to_string())
+            } else {
+                reason.to_string()
+            };
+            message.actions = Some(vec![InteractionAction {
+                label: "Open log".to_string(),
+                payload: "open_terminal".to_string(),
+                style: Some(InteractionActionStyle::Default),
+            }]);
+        }
+        PaneStatus::Done => {
+            message.kind = InteractionKind::Done;
+            message.priority = InteractionPriority::Normal;
+            message.title = "Completed".to_string();
+            message.body = if title.is_empty() {
+                if reason.is_empty() {
+                    "Task completed.".to_string()
+                } else {
+                    reason.to_string()
+                }
+            } else {
+                format!("Finished {title}.")
+            };
+        }
+        PaneStatus::Idle => {}
+    }
+
+    let feedback_message = phase_feedback_message(
+        pane,
+        &lines,
+        status,
+        reason,
+        now,
+        fingerprint,
+        history_message.source.clone(),
+    );
+
+    vec![history_message, message, feedback_message]
+}
+
+fn pane_status_key(status: &PaneStatus) -> &'static str {
+    match status {
+        PaneStatus::Running => "running",
+        PaneStatus::Waiting => "waiting",
+        PaneStatus::Idle => "idle",
+        PaneStatus::Failed => "failed",
+        PaneStatus::Done => "done",
+    }
+}
+
+fn limit_string(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn parse_interaction_role(value: Option<&str>) -> InteractionRole {
+    match value {
+        Some("user") => InteractionRole::User,
+        Some("system") => InteractionRole::System,
+        _ => InteractionRole::Agent,
+    }
+}
+
+fn parse_interaction_kind(value: Option<&str>, fallback: &InteractionKind) -> InteractionKind {
+    match value {
+        Some("summary") => InteractionKind::Summary,
+        Some("question") => InteractionKind::Question,
+        Some("permission_request") => InteractionKind::PermissionRequest,
+        Some("progress") => InteractionKind::Progress,
+        Some("error") => InteractionKind::Error,
+        Some("done") => InteractionKind::Done,
+        Some("notification") => InteractionKind::Notification,
+        Some("status") => InteractionKind::Status,
+        _ => fallback.clone(),
+    }
+}
+
+fn parse_interaction_priority(value: Option<&str>) -> InteractionPriority {
+    match value {
+        Some("low") => InteractionPriority::Low,
+        Some("high") => InteractionPriority::High,
+        _ => InteractionPriority::Normal,
+    }
+}
+
+fn normalize_interaction_message(
+    value: &serde_json::Value,
+    pane_id: &str,
+    now: &str,
+    fallback: &InteractionMessage,
+) -> Option<InteractionMessage> {
+    let object = value.as_object()?;
+    let title = object
+        .get("title")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| limit_string(value.trim(), 80))
+        .unwrap_or_else(|| fallback.title.clone());
+    let body = object
+        .get("body")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| limit_string(value.trim(), 800))
+        .unwrap_or_else(|| fallback.body.clone());
+    let kind = parse_interaction_kind(
+        object.get("kind").and_then(|value| value.as_str()),
+        &fallback.kind,
+    );
+    let actions = object
+        .get("actions")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let action = item.as_object()?;
+                    let label = action.get("label")?.as_str()?;
+                    let payload = action.get("payload")?.as_str()?;
+                    Some(InteractionAction {
+                        label: limit_string(label, 32),
+                        payload: limit_string(payload, 120),
+                        style: match action.get("style").and_then(|value| value.as_str()) {
+                            Some("destructive") => Some(InteractionActionStyle::Destructive),
+                            _ => Some(InteractionActionStyle::Default),
+                        },
+                    })
+                })
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .or_else(|| fallback.actions.clone());
+
+    Some(InteractionMessage {
+        id: object
+            .get("id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("{pane_id}:{}:{}", interaction_kind_key(&kind), tail_hash(&format!("{title}\n{body}")))),
+        pane_id: pane_id.to_string(),
+        role: parse_interaction_role(object.get("role").and_then(|value| value.as_str())),
+        kind,
+        priority: parse_interaction_priority(object.get("priority").and_then(|value| value.as_str())),
+        title,
+        body,
+        actions,
+        source: fallback.source.clone(),
+        created_at: object
+            .get("createdAt")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(now)
+            .to_string(),
+    })
+}
+
+fn interaction_kind_key(kind: &InteractionKind) -> &'static str {
+    match kind {
+        InteractionKind::Summary => "summary",
+        InteractionKind::Status => "status",
+        InteractionKind::Question => "question",
+        InteractionKind::PermissionRequest => "permission_request",
+        InteractionKind::Progress => "progress",
+        InteractionKind::Error => "error",
+        InteractionKind::Done => "done",
+        InteractionKind::Notification => "notification",
+    }
+}
+
+fn interaction_messages_for_pane(
+    pane: &BasePane,
+    tail: &str,
+    status: &PaneStatus,
+    reason: &str,
+    now: &str,
+) -> Vec<InteractionMessage> {
+    let fingerprint = tail_hash(&activity_fingerprint(tail));
+    let cache_key = format!("{}:{}:{fingerprint}", pane.id, pane_status_key(status));
+    let fallback = local_interaction_messages(pane, tail, status, reason, now);
+
+    if let Some(cached) = MESSAGE_CACHE
+        .lock()
+        .expect("message cache mutex poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
+    }
+
+    spawn_deepseek_interpretation(
+        cache_key,
+        pane.clone(),
+        tail.to_string(),
+        status.clone(),
+        reason.to_string(),
+        now.to_string(),
+        fallback.clone(),
+    );
+    fallback
+}
+
+fn spawn_deepseek_interpretation(
+    cache_key: String,
+    pane: BasePane,
+    tail: String,
+    status: PaneStatus,
+    reason: String,
+    now: String,
+    fallback: Vec<InteractionMessage>,
+) {
+    let api_key = env::var("AGENT_MONITOR_DEEPSEEK_API_KEY")
+        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+        .unwrap_or_default();
+    if api_key.is_empty() {
+        return;
+    }
+
+    {
+        let mut pending = PENDING_INTERPRETATIONS
+            .lock()
+            .expect("pending interpretations mutex poisoned");
+        if pending.contains_key(&cache_key) {
+            return;
+        }
+        pending.insert(cache_key.clone(), ());
+    }
+
+    thread::spawn(move || {
+        let result = interpret_with_deepseek(&api_key, &pane, &tail, &status, &reason, &now, &fallback);
+        if let Some(messages) = result.filter(|messages| !messages.is_empty()) {
+            MESSAGE_CACHE
+                .lock()
+                .expect("message cache mutex poisoned")
+                .insert(cache_key.clone(), messages);
+        }
+        PENDING_INTERPRETATIONS
+            .lock()
+            .expect("pending interpretations mutex poisoned")
+            .remove(&cache_key);
+    });
+}
+
+fn interpret_with_deepseek(
+    api_key: &str,
+    pane: &BasePane,
+    tail: &str,
+    status: &PaneStatus,
+    reason: &str,
+    now: &str,
+    fallback: &[InteractionMessage],
+) -> Option<Vec<InteractionMessage>> {
+    let base_url = env::var("AGENT_MONITOR_DEEPSEEK_BASE_URL")
+        .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
+    let model = env::var("AGENT_MONITOR_DEEPSEEK_MODEL")
+        .or_else(|_| env::var("DEEPSEEK_MODEL"))
+        .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let first_fallback = fallback.first()?;
+    let body = json!({
+        "model": model,
+        "response_format": { "type": "json_object" },
+        "messages": [
+            {
+                "role": "system",
+                "content": "You convert terminal logs from coding agents into concise product-facing interaction messages.\nReturn only JSON with a messages array. Do not include markdown.\nDo not expose secrets, tokens, raw stack traces, or long logs.\nReturn exactly 3 messages in this order: recent work summary, current state, phase feedback.\nThe first message must be kind summary with title Recent work and must summarize what the agent recently completed or attempted.\nThe second message should describe current state: Working, Waiting, Completed, Failed, or Idle.\nThe third message should be phase feedback: newest checkpoint, blocker, completion feedback, or next useful step.\nMessages must follow: role agent|system, kind summary|status|question|permission_request|progress|error|done|notification, priority low|normal|high, title, body, actions."
+            },
+            {
+                "role": "user",
+                "content": json!({
+                    "pane": {
+                        "id": pane.id,
+                        "session": pane.session,
+                        "command": pane.command,
+                        "title": pane.title,
+                        "status": pane_status_key(status),
+                        "reason": reason,
+                    },
+                    "recentLog": meaningful_tail_lines(tail, 18).join("\n"),
+                }).to_string()
+            }
+        ]
+    });
+
+    let response = client
+        .post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let value = response.json::<serde_json::Value>().ok()?;
+    let content = value
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()?;
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let messages = parsed
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let fallback_message = fallback
+                .get(index.min(fallback.len().saturating_sub(1)))
+                .unwrap_or(first_fallback);
+            normalize_interaction_message(message, &pane.id, now, fallback_message)
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    Some(messages)
+}
+
+fn deepseek_api_key() -> String {
+    env::var("AGENT_MONITOR_DEEPSEEK_API_KEY")
+        .or_else(|_| env::var("DEEPSEEK_API_KEY"))
+        .unwrap_or_default()
+}
+
+fn deepseek_base_url() -> String {
+    env::var("AGENT_MONITOR_DEEPSEEK_BASE_URL")
+        .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.deepseek.com".to_string())
+}
+
+fn deepseek_model() -> String {
+    env::var("AGENT_MONITOR_DEEPSEEK_MODEL")
+        .or_else(|_| env::var("DEEPSEEK_MODEL"))
+        .unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+}
+
+fn normalize_refined_text(original: &str, value: &serde_json::Value) -> String {
+    let Some(text) = value.get("text").and_then(|item| item.as_str()).map(str::trim) else {
+        return original.to_string();
+    };
+    if text.is_empty() || text.len() > 4000 {
+        original.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn refine_text_with_deepseek(text: &str) -> serde_json::Value {
+    let original = text.trim();
+    if original.is_empty() {
+        return json!({ "ok": true, "text": original, "changed": false });
+    }
+
+    let api_key = deepseek_api_key();
+    if api_key.is_empty() {
+        return json!({
+            "ok": true,
+            "text": original,
+            "changed": false,
+            "fallback": true,
+            "error": "DeepSeek API key is not configured"
+        });
+    }
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return json!({
+                "ok": true,
+                "text": original,
+                "changed": false,
+                "fallback": true,
+                "error": error.to_string()
+            });
+        }
+    };
+
+    let body = json!({
+        "model": deepseek_model(),
+        "response_format": { "type": "json_object" },
+        "messages": [
+            {
+                "role": "system",
+                "content": "You clean up speech-to-text drafts before they are sent to a coding agent.\nReturn only JSON: {\"text\":\"...\"}.\nPreserve the user's intent, language, tone, and commands.\nAdd punctuation and paragraph breaks when useful.\nFix likely technical terms such as Claude Code, Codex, tmux, SwiftUI, Xcode, TestFlight, DeepSeek, API, WebSocket, TypeScript, React, Rust, iOS, macOS, zsh, npm, cargo, xcodebuild.\nDo not add new instructions, explanations, markdown, quotes, greetings, or summaries.\nIf the draft already looks correct, return it unchanged."
+            },
+            {
+                "role": "user",
+                "content": json!({ "text": original }).to_string()
+            }
+        ]
+    });
+
+    let response = match client
+        .post(format!("{}/chat/completions", deepseek_base_url().trim_end_matches('/')))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return json!({
+                "ok": true,
+                "text": original,
+                "changed": false,
+                "fallback": true,
+                "error": error.to_string()
+            });
+        }
+    };
+
+    if !response.status().is_success() {
+        return json!({
+            "ok": true,
+            "text": original,
+            "changed": false,
+            "fallback": true,
+            "error": format!("DeepSeek HTTP {}", response.status())
+        });
+    }
+
+    let value = match response.json::<serde_json::Value>() {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "ok": true,
+                "text": original,
+                "changed": false,
+                "fallback": true,
+                "error": error.to_string()
+            });
+        }
+    };
+    let content = value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str());
+
+    let Some(content) = content else {
+        return json!({
+            "ok": true,
+            "text": original,
+            "changed": false,
+            "fallback": true,
+            "error": "DeepSeek returned empty content"
+        });
+    };
+
+    let parsed = match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "ok": true,
+                "text": original,
+                "changed": false,
+                "fallback": true,
+                "error": error.to_string()
+            });
+        }
+    };
+    let refined = normalize_refined_text(original, &parsed);
+    json!({ "ok": true, "text": refined, "changed": refined != original })
+}
+
+fn track_pane_activity(pane_id: &str, tail: &str) -> bool {
+    let hash = tail_hash(&activity_fingerprint(tail));
+    let mut activity = PANE_ACTIVITY.lock().expect("pane activity mutex poisoned");
+    let now = Instant::now();
+
+    match activity.get_mut(pane_id) {
+        Some(previous) if previous.tail_hash == hash => false,
+        Some(previous) => {
+            previous.tail_hash = hash;
+            previous.changed_at = now;
+            true
+        }
+        None => {
+            activity.insert(
+                pane_id.to_string(),
+                PaneActivity {
+                    tail_hash: hash,
+                    changed_at: now,
+                },
+            );
+            false
+        }
+    }
+}
+
 fn build_snapshot() -> Snapshot {
     let now = now_iso();
     let panes = match list_panes() {
@@ -460,7 +1507,9 @@ fn build_snapshot() -> Snapshot {
         .into_iter()
         .map(|pane| {
             let tail = capture_pane(&pane.id);
-            let (status, reason) = infer_status(&pane, &tail);
+            let changed_recently = track_pane_activity(&pane.id, &tail);
+            let (status, reason) = infer_status(&pane, &tail, changed_recently);
+            let messages = interaction_messages_for_pane(&pane, &tail, &status, &reason, &now);
 
             Pane {
                 id: pane.id,
@@ -478,6 +1527,7 @@ fn build_snapshot() -> Snapshot {
                 status,
                 reason,
                 updated_at: now.clone(),
+                messages,
             }
         })
         .collect();
@@ -497,6 +1547,83 @@ fn broadcast_snapshot(state: &AppState) -> Snapshot {
         "snapshot": snapshot,
     }));
     snapshot
+}
+
+fn request_pane_log_refresh(state: &AppState, pane_id: &str) {
+    let _ = state.pane_log_refreshes.send(pane_id.to_string());
+}
+
+fn request_pane_log_refresh_burst(state: &AppState, pane_id: &str) {
+    let burst_id = PANE_LOG_REFRESH_BURST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut bursts = PANE_LOG_REFRESH_BURST_IDS.lock().unwrap();
+        bursts.insert(pane_id.to_string(), burst_id);
+    }
+
+    for delay_ms in PANE_LOG_REFRESH_BURST_DELAYS_MS {
+        if *delay_ms == 0 {
+            request_pane_log_refresh(state, pane_id);
+            continue;
+        }
+
+        let state = state.clone();
+        let pane_id = pane_id.to_string();
+        let delay_ms = *delay_ms;
+        let is_last_refresh = delay_ms == *PANE_LOG_REFRESH_BURST_DELAYS_MS.last().unwrap_or(&0);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let is_current = PANE_LOG_REFRESH_BURST_IDS
+                .lock()
+                .unwrap()
+                .get(&pane_id)
+                .copied()
+                == Some(burst_id);
+            if is_current {
+                request_pane_log_refresh(&state, &pane_id);
+                if is_last_refresh {
+                    PANE_LOG_REFRESH_BURST_IDS.lock().unwrap().remove(&pane_id);
+                }
+            }
+        });
+    }
+}
+
+async fn pane_command_response_after_command(
+    state: &AppState,
+    pane_id: &str,
+    previous_tail: String,
+) -> serde_json::Value {
+    let mut tail = String::new();
+    for delay_ms in PANE_COMMAND_TAIL_SETTLE_DELAYS_MS {
+        if *delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
+
+        tail = capture_pane_lines(pane_id, PANE_COMMAND_TAIL_LINE_COUNT);
+        if tail != previous_tail {
+            break;
+        }
+    }
+
+    request_pane_log_refresh(state, pane_id);
+
+    json!({
+        "ok": true,
+        "paneId": pane_id,
+        "tail": tail,
+        "capturedAt": now_iso(),
+    })
+}
+
+fn schedule_snapshot_refresh_soon(state: &AppState) {
+    let refresh_id = SNAPSHOT_REFRESH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        if SNAPSHOT_REFRESH_COUNTER.load(Ordering::Relaxed) == refresh_id + 1 {
+            let _ = broadcast_snapshot(&state);
+        }
+    });
 }
 
 fn spawn_snapshot_loop(state: AppState) {
@@ -543,6 +1670,33 @@ async fn api_snapshot(
     json_response(StatusCode::OK, broadcast_snapshot(&state))
 }
 
+async fn api_pane_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+
+    let Some(pane_id) = query.get("paneId").filter(|value| !value.is_empty()) else {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "paneId is required" }));
+    };
+
+    let lines = context_line_count(query.get("lines"));
+    let tail = capture_pane_lines(pane_id, lines);
+    json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "paneId": pane_id,
+            "lines": lines,
+            "tail": tail,
+            "capturedAt": now_iso(),
+        }),
+    )
+}
+
 async fn api_send(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -567,6 +1721,31 @@ async fn api_send(
         );
     }
 
+    let requested_submit_key = match body.submit_key.as_deref() {
+        Some("Enter") | Some("Tab") => body.submit_key.as_deref(),
+        Some(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid submitKey" }),
+            );
+        }
+        None if body.enter != Some(false) => Some("Enter"),
+        None => None,
+    };
+
+    let submit_key = list_panes()
+        .ok()
+        .and_then(|panes| panes.into_iter().find(|pane| pane.id == body.pane_id))
+        .and_then(|pane| {
+            if is_codex_pane(&pane, "") {
+                Some("Tab")
+            } else {
+                requested_submit_key
+            }
+        })
+        .or(requested_submit_key);
+    let previous_tail = capture_pane_lines(&body.pane_id, PANE_COMMAND_TAIL_LINE_COUNT);
+
     if body.vim_mode.unwrap_or(false) {
         if let Err(error) = send_key_parts(&body.pane_id, &["C-[", "i"]) {
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
@@ -577,14 +1756,116 @@ async fn api_send(
         return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
     }
 
-    if body.enter != Some(false) {
-        if let Err(error) = send_key_parts(&body.pane_id, &["Enter"]) {
+    if let Some(key) = submit_key {
+        if let Err(error) = send_key_parts(&body.pane_id, &[key]) {
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
         }
     }
 
-    broadcast_snapshot(&state);
-    json_response(StatusCode::OK, json!({ "ok": true }))
+    request_pane_log_refresh_burst(&state, &body.pane_id);
+    schedule_snapshot_refresh_soon(&state);
+    json_response(
+        StatusCode::OK,
+        pane_command_response_after_command(&state, &body.pane_id, previous_tail).await,
+    )
+}
+
+async fn api_refine_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<RefineTextRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+
+    if body.text.len() > 4000 {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "text is too long" }));
+    }
+
+    let original = body.text;
+    let fallback_text = original.trim().to_string();
+    let result = tokio::task::spawn_blocking(move || refine_text_with_deepseek(&original)).await;
+    match result {
+        Ok(value) => json_response(StatusCode::OK, value),
+        Err(error) => json_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "text": fallback_text,
+                "changed": false,
+                "fallback": true,
+                "error": error.to_string()
+            }),
+        ),
+    }
+}
+
+async fn api_upload_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+
+    if body.is_empty() {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "image is required" }));
+    }
+
+    if body.len() > 8 * 1024 * 1024 {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "image is too large" }));
+    }
+
+    let Some((extension, content_type)) = detect_image_upload(&body) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "only jpg and png are supported" }),
+        );
+    };
+
+    let pane_id = query.get("paneId").map(String::as_str).unwrap_or("unknown");
+    let timestamp = now_iso().replace([':', '.'], "-");
+    let filename = format!("{timestamp}-{}{}", safe_upload_pane_name(pane_id), extension);
+    let upload_dir = upload_output_dir();
+    let file_path = upload_dir.join(filename);
+
+    if !file_path.starts_with(&upload_dir) {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "invalid upload path" }));
+    }
+
+    if let Err(error) = fs::create_dir_all(&upload_dir) {
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": format!("failed to create upload dir: {error}") }),
+        );
+    }
+
+    if let Err(error) = fs::write(&file_path, &body) {
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": format!("failed to write image: {error}") }),
+        );
+    }
+
+    eprintln!(
+        "[agent-monitor] uploaded image for {pane_id}: {} bytes -> {}",
+        body.len(),
+        file_path.display()
+    );
+
+    json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "path": file_path.to_string_lossy(),
+            "size": body.len(),
+            "contentType": content_type,
+        }),
+    )
 }
 
 async fn api_key(
@@ -600,6 +1881,7 @@ async fn api_key(
     let key = query.get("key").cloned().unwrap_or_default();
     let allowed = [
         "Enter",
+        "Tab",
         "C-c",
         "C-d",
         "C-[",
@@ -619,6 +1901,8 @@ async fn api_key(
         );
     }
 
+    let previous_tail = capture_pane_lines(&pane_id, PANE_COMMAND_TAIL_LINE_COUNT);
+
     let result = match key.as_str() {
         "VimClear" => send_key_parts(&pane_id, &["C-[", "0", "D", "i"]),
         "VimBackspace" => send_key_parts(&pane_id, &["C-[", "i", "BSpace"]),
@@ -629,8 +1913,12 @@ async fn api_key(
         return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
     }
 
-    broadcast_snapshot(&state);
-    json_response(StatusCode::OK, json!({ "ok": true }))
+    request_pane_log_refresh_burst(&state, &pane_id);
+    schedule_snapshot_refresh_soon(&state);
+    json_response(
+        StatusCode::OK,
+        pane_command_response_after_command(&state, &pane_id, previous_tail).await,
+    )
 }
 
 fn send_key_parts(pane_id: &str, parts: &[&str]) -> Result<(), String> {
@@ -656,19 +1944,28 @@ async fn api_kill_session(
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
 
-    if body.session.is_empty() {
+    if let Some(pane_id) = body.pane_id.filter(|value| !value.is_empty()) {
+        eprintln!("[agent-monitor] closing tmux pane {pane_id}");
+        if let Err(error) = run_tmux(&["kill-pane".to_string(), "-t".to_string(), pane_id]) {
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
+        }
+
+        broadcast_snapshot(&state);
+        return json_response(StatusCode::OK, json!({ "ok": true }));
+    }
+
+    let Some(session) = body.session.filter(|value| !value.is_empty()) else {
         return json_response(
             StatusCode::BAD_REQUEST,
-            json!({ "error": "session is required" }),
+            json!({ "error": "paneId or session is required" }),
         );
-    }
+    };
 
-    if let Err(error) = run_tmux(&["kill-session".to_string(), "-t".to_string(), body.session]) {
-        return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
-    }
-
-    broadcast_snapshot(&state);
-    json_response(StatusCode::OK, json!({ "ok": true }))
+    eprintln!("[agent-monitor] rejected session-level kill for {session}");
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({ "error": "session-level kill is disabled; refresh the client and close a pane instead" }),
+    )
 }
 
 async fn snapshot_ws(
@@ -713,6 +2010,122 @@ async fn handle_snapshot_socket(socket: WebSocket, state: AppState) {
             incoming = receiver.next() => {
                 if incoming.is_none() {
                     break;
+                }
+            }
+        }
+    }
+}
+
+async fn pane_log_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if !is_authed(&state, &headers, &query) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    ws.on_upgrade(move |socket| async move {
+        handle_pane_log_socket(socket, query, state.pane_log_refreshes.subscribe()).await;
+    })
+    .into_response()
+}
+
+async fn handle_pane_log_socket(
+    socket: WebSocket,
+    query: HashMap<String, String>,
+    mut refreshes: broadcast::Receiver<String>,
+) {
+    let pane_id = query.get("paneId").cloned().unwrap_or_default();
+    if pane_id.is_empty() {
+        let (mut sender, _) = socket.split();
+        let _ = sender
+            .send(Message::Text(
+                json!({ "type": "error", "error": "paneId is required" })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    }
+
+    let line_count = pane_log_line_count(query.get("lines"));
+    let (mut sender, mut receiver) = socket.split();
+
+    async fn send_pane_tail(
+        sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+        pane_id: &str,
+        tail: &str,
+    ) -> Result<(), axum::Error> {
+        sender
+            .send(Message::Text(
+                json!({
+                    "type": "paneLog",
+                    "paneId": pane_id,
+                    "tail": tail,
+                    "capturedAt": now_iso(),
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+    }
+
+    async fn capture_and_send_if_changed(
+        sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+        pane_id: &str,
+        line_count: usize,
+        last_tail: &mut String,
+    ) -> Result<(), axum::Error> {
+        let next_tail = capture_pane_lines(pane_id, line_count);
+        if next_tail == *last_tail {
+            return Ok(());
+        }
+
+        *last_tail = next_tail;
+        send_pane_tail(sender, pane_id, last_tail).await
+    }
+
+    let mut last_tail = capture_pane_lines(&pane_id, line_count);
+    if send_pane_tail(&mut sender, &pane_id, &last_tail).await.is_err() {
+        return;
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_millis(350));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                    break;
+                }
+            }
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) if text.contains("refresh") => {
+                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Binary(data))) if data.windows(7).any(|item| item == b"refresh") => {
+                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            refresh = refreshes.recv() => {
+                match refresh {
+                    Ok(refresh_pane_id) if refresh_pane_id == pane_id => {
+                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
@@ -943,92 +2356,4 @@ async fn send_terminal_error(socket: &mut WebSocket, error: String) {
         ))
         .await;
     let _ = socket.close().await;
-}
-
-async fn static_handler(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
-    if request.method() != Method::GET && request.method() != Method::HEAD {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from("Not found"))
-            .expect("response builder");
-    }
-
-    let Some(file_path) = resolve_public_path(&state.public_dir, request.uri().path()) else {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from("Not found"))
-            .expect("response builder");
-    };
-
-    let Ok(metadata) = tokio::fs::metadata(&file_path).await else {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from("Not found"))
-            .expect("response builder");
-    };
-    if !metadata.is_file() {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from("Not found"))
-            .expect("response builder");
-    }
-
-    let content_type = mime_guess::from_path(&file_path)
-        .first_or_octet_stream()
-        .to_string();
-
-    if request.method() == Method::HEAD {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, metadata.len())
-            .body(Body::empty())
-            .expect("response builder");
-    }
-
-    match tokio::fs::read(&file_path).await {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, bytes.len())
-            .body(Body::from(bytes))
-            .expect("response builder"),
-        Err(_) => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from("Not found"))
-            .expect("response builder"),
-    }
-}
-
-fn resolve_public_path(public_dir: &Path, uri_path: &str) -> Option<PathBuf> {
-    let relative = if uri_path == "/" {
-        "index.html".to_string()
-    } else {
-        percent_decode_str(uri_path.trim_start_matches('/'))
-            .decode_utf8()
-            .ok()?
-            .to_string()
-    };
-
-    let mut path = public_dir.to_path_buf();
-    for component in Path::new(&relative).components() {
-        match component {
-            Component::Normal(part) => path.push(part),
-            _ => return None,
-        }
-    }
-
-    let canonical_public = fs::canonicalize(public_dir).ok()?;
-    let parent = path.parent().unwrap_or(public_dir);
-    let canonical_parent = fs::canonicalize(parent).ok()?;
-    if !canonical_parent.starts_with(canonical_public) {
-        return None;
-    }
-
-    Some(path)
 }

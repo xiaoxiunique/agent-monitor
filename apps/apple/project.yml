@@ -4,6 +4,10 @@ options:
   deploymentTarget:
     macOS: "14.0"
     iOS: "17.0"
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: "1.13.0"
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -30,23 +34,38 @@ targets:
     platform: iOS
     sources:
       - iOS
+    dependencies:
+      - package: SwiftTerm
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.hcg.AgentMonitor
         PRODUCT_NAME: Agent Monitor
         MARKETING_VERSION: "0.1"
-        CURRENT_PROJECT_VERSION: "1"
+        CURRENT_PROJECT_VERSION: "33"
+        DEVELOPMENT_TEAM: S77C743756
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        SWIFT_OBJC_BRIDGING_HEADER: iOS/Services/AgentMonitoriOS-Bridging-Header.h
     info:
       path: iOS/Resources/Info.plist
       properties:
         CFBundleDisplayName: Agent Monitor
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen:
-          UIColorName: ""
+          UIColorName: LaunchBackground
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - audio
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsArbitraryLoadsInWebContent: true
-          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Agent Monitor connects to the local Mac service on your LAN or Tailscale network.
+        NSMicrophoneUsageDescription: Agent Monitor uses the microphone to turn your voice into text before sending it to the agent.
+        NSPhotoLibraryUsageDescription: Agent Monitor lets you choose images to send to the agent running on your Mac.
+        NSSpeechRecognitionUsageDescription: Agent Monitor uses speech recognition to transcribe voice input into the message field.

@@ -11,9 +11,6 @@ APP_NAME="Agent Monitor.app"
 APP_PATH="$DIST_DIR/$APP_NAME"
 DMG_PATH="$DIST_DIR/AgentMonitor.dmg"
 
-cd "$SERVICE_DIR"
-npm run build:web
-
 cd "$ROOT_DIR"
 cargo build --release --manifest-path "$RUST_SERVICE_DIR/Cargo.toml"
 
@@ -31,19 +28,7 @@ mkdir -p "$DIST_DIR"
 ditto "$DERIVED_DATA_DIR/Build/Products/Release/$APP_NAME" "$APP_PATH"
 
 RESOURCES_DIR="$APP_PATH/Contents/Resources"
-PUBLIC_RESOURCE_DIR="$RESOURCES_DIR/public"
-mkdir -p "$PUBLIC_RESOURCE_DIR"
-
-rsync -a --delete \
-  --exclude '.git' \
-  --exclude '.DS_Store' \
-  "$SERVICE_DIR/public" \
-  "$RESOURCES_DIR/"
-
-mkdir -p "$PUBLIC_RESOURCE_DIR/vendor"
-cp "$SERVICE_DIR/node_modules/@xterm/xterm/css/xterm.css" "$PUBLIC_RESOURCE_DIR/vendor/xterm.css"
-cp "$SERVICE_DIR/node_modules/@xterm/xterm/lib/xterm.js" "$PUBLIC_RESOURCE_DIR/vendor/xterm.js"
-cp "$SERVICE_DIR/node_modules/@xterm/addon-fit/lib/addon-fit.js" "$PUBLIC_RESOURCE_DIR/vendor/addon-fit.js"
+mkdir -p "$RESOURCES_DIR"
 
 cp "$RUST_SERVICE_DIR/target/release/agent-monitor-service" "$RESOURCES_DIR/agent-monitor-service"
 chmod 755 "$RESOURCES_DIR/agent-monitor-service"
