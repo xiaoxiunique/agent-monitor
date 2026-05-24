@@ -109,6 +109,48 @@ struct Pane: Codable, Identifiable, Equatable {
     }
 }
 
+enum AgentEventRole: String, Codable, Equatable {
+    case agent
+    case user
+    case system
+}
+
+enum AgentEventKind: String, Codable, Equatable {
+    case text
+    case toolCall = "tool_call"
+    case toolResult = "tool_result"
+    case turn
+    case status
+}
+
+struct AgentEventSource: Codable, Equatable {
+    let agent: String
+    let path: String?
+    let sessionId: String?
+}
+
+struct AgentEvent: Codable, Identifiable, Equatable {
+    let id: String
+    let paneId: String
+    let role: AgentEventRole
+    let kind: AgentEventKind
+    let title: String
+    let body: String
+    let createdAt: Date
+    let toolName: String?
+    let callId: String?
+    let status: String?
+}
+
+struct AgentEventsResponse: Codable, Equatable {
+    let ok: Bool
+    let paneId: String
+    let source: AgentEventSource
+    let events: [AgentEvent]
+    let capturedAt: Date
+    let error: String?
+}
+
 struct Snapshot: Codable, Equatable {
     let ok: Bool
     let now: Date

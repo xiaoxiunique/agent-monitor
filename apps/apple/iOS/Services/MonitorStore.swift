@@ -257,6 +257,15 @@ final class MonitorStore {
         return response
     }
 
+    func loadPaneEvents(_ pane: Pane, limit: Int = 140) async throws -> AgentEventsResponse {
+        guard let context = makeServerRequestContext() else {
+            throw AgentMonitorError.invalidServerURL
+        }
+        let response = try await context.client.paneEvents(for: pane, limit: limit)
+        guard isCurrentServer(context.identity) else { throw CancellationError() }
+        return response
+    }
+
     func makeClient() -> AgentMonitorClient? {
         guard let baseURL = settings.baseURL else { return nil }
         return AgentMonitorClient(baseURL: baseURL, token: settings.accessToken)

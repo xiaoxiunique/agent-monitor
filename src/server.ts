@@ -5,6 +5,7 @@ import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pty from "node-pty";
 import { WebSocket, WebSocketServer } from "ws";
+import { agentEventsForPane } from "./agent-events.js";
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_HOST = "0.0.0.0";
@@ -105,6 +106,8 @@ type RefinedTextResponse = {
   error?: string;
 };
 
+type AgentEventsResponse = Awaited<ReturnType<typeof agentEventsForPane>>;
+
 function sendJson(res: ServerResponse, data: unknown, status = 200): void {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data));
@@ -198,6 +201,12 @@ function contextLineCount(value: string | null): number {
   const parsed = Number(value ?? "1200");
   if (!Number.isFinite(parsed)) return 1200;
   return Math.max(100, Math.min(5000, Math.floor(parsed)));
+}
+
+function eventLimit(value: string | null): number {
+  const parsed = Number(value ?? "120");
+  if (!Number.isFinite(parsed)) return 120;
+  return Math.max(20, Math.min(300, Math.floor(parsed)));
 }
 
 function paneLogLineCount(value: string | null): number {
@@ -1132,6 +1141,26 @@ async function handleKillSession(req: IncomingMessage, res: ServerResponse): Pro
   return sendJson(res, { error: "session-level kill is disabled; refresh the client and close a pane instead" }, 400);
 }
 
+async function handlePaneEvents(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  if (!isAuthed(req)) return sendJson(res, { error: "unauthorized" }, 401);
+
+  const paneId = url.searchParams.get("paneId");
+  if (!paneId) return sendJson(res, { error: "paneId is required" }, 400);
+
+  const listed = listPanes();
+  if (!listed.ok) return sendJson(res, { error: listed.error }, 500);
+
+  const pane = listed.panes.find((item) => item.id === paneId);
+  if (!pane) return sendJson(res, { error: "pane not found" }, 404);
+
+  const tail = capturePane(pane.id);
+  const response: AgentEventsResponse = await agentEventsForPane(
+    { ...pane, tail },
+    { limit: eventLimit(url.searchParams.get("limit")) },
+  );
+  return sendJson(res, response, response.ok ? 200 : 404);
+}
+
 const httpServer = createServer(async (req, res) => {
   const url = requestUrl(req);
 
@@ -1155,6 +1184,10 @@ const httpServer = createServer(async (req, res) => {
       tail,
       capturedAt: new Date().toISOString(),
     });
+  }
+
+  if (url.pathname === "/api/pane/events") {
+    return handlePaneEvents(req, res, url);
   }
 
   if (url.pathname === "/api/send" && req.method === "POST") {

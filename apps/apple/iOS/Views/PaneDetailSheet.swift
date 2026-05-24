@@ -175,7 +175,8 @@ struct PaneDetailView: View {
     private func rememberUserMessage(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        userMessages.append(UserInteractionMessage(text: trimmed, sentAt: Date()))
+        let message = UserInteractionMessage(text: trimmed, sentAt: Date())
+        userMessages.append(message)
         if userMessages.count > 40 {
             userMessages.removeFirst(userMessages.count - 40)
         }
@@ -261,6 +262,9 @@ private struct AgentChatTimelineContainer: View {
 
     @Environment(MonitorStore.self) private var store
     @Environment(\.colorScheme) private var colorScheme
+    @State private var transcriptEvents: [AgentEvent] = []
+    @State private var transcriptSource: AgentEventSource?
+    @State private var eventsRefreshTask: Task<Void, Never>?
     @State private var isUserNearTail = true
     @State private var scrollViewportHeight: CGFloat = 0
     @State private var tailMinY: CGFloat = .infinity
@@ -282,7 +286,9 @@ private struct AgentChatTimelineContainer: View {
                         session: currentPane.session,
                         status: currentPane.status,
                         updatedAt: currentPane.updatedAt,
-                        isLiveServer: isLiveServer
+                        isLiveServer: isLiveServer,
+                        sourceAgent: transcriptSource?.agent,
+                        hasTranscript: !transcriptEvents.isEmpty
                     )
 
                     ForEach(chatEvents) { event in
@@ -300,6 +306,19 @@ private struct AgentChatTimelineContainer: View {
                                 onOpenTerminal: onOpenTerminal,
                                 onSendAction: onSendAction
                             )
+                        case let .transcript(message):
+                            switch message.role {
+                            case .user:
+                                TranscriptUserBubble(event: message)
+                            case .agent:
+                                TranscriptAgentBubble(
+                                    session: currentPane.session,
+                                    status: currentPane.status,
+                                    event: message
+                                )
+                            case .system:
+                                TranscriptSystemEventRow(event: message)
+                            }
                         case let .user(message):
                             UserMessageBubble(message: message)
                         }
@@ -340,6 +359,11 @@ private struct AgentChatTimelineContainer: View {
             .onAppear {
                 scrollToTail(proxy, animated: false)
                 lastAutoScrolledEventFingerprint = eventFingerprint(for: chatEvents)
+                startTranscriptRefreshLoop()
+            }
+            .onDisappear {
+                eventsRefreshTask?.cancel()
+                eventsRefreshTask = nil
             }
             .onChange(of: chatEvents) { _, events in
                 let fingerprint = eventFingerprint(for: events)
@@ -349,12 +373,29 @@ private struct AgentChatTimelineContainer: View {
             }
             .onChange(of: currentPane.updatedAt) { _, _ in
                 guard isUserNearTail else { return }
+                refreshTranscriptEvents()
                 scrollToTail(proxy, animated: true)
             }
         }
     }
 
     private var chatEvents: [AgentChatEvent] {
+        if !transcriptEvents.isEmpty {
+            let transcript = transcriptEvents.map(AgentChatEvent.transcript)
+            let localUserEvents = userMessages
+                .filter { message in
+                    !transcriptEvents.contains(where: { event in
+                        event.role == .user && event.localMatchId == message.eventMatchId
+                    })
+                }
+                .map(AgentChatEvent.user)
+            return (transcript + localUserEvents).sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                if lhs.sortRank != rhs.sortRank { return lhs.sortRank < rhs.sortRank }
+                return lhs.id < rhs.id
+            }
+        }
+
         let agentMessages = conversationMessages(for: currentPane)
         let agentEvents = agentMessages.map(AgentChatEvent.agent)
         let userEvents = userMessages.map(AgentChatEvent.user)
@@ -362,6 +403,38 @@ private struct AgentChatTimelineContainer: View {
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
             if lhs.sortRank != rhs.sortRank { return lhs.sortRank < rhs.sortRank }
             return lhs.id < rhs.id
+        }
+    }
+
+    private func startTranscriptRefreshLoop() {
+        guard isLiveServer else { return }
+        guard eventsRefreshTask == nil else { return }
+        refreshTranscriptEvents()
+        eventsRefreshTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    refreshTranscriptEvents()
+                }
+            }
+        }
+    }
+
+    private func refreshTranscriptEvents() {
+        guard isLiveServer else { return }
+        let pane = currentPane
+        Task {
+            do {
+                let response = try await store.loadPaneEvents(pane)
+                guard response.paneId == initialPane.id else { return }
+                await MainActor.run {
+                    transcriptEvents = response.events
+                    transcriptSource = response.source
+                }
+            } catch {
+                return
+            }
         }
     }
 
@@ -561,11 +634,13 @@ private struct ChatViewportHeightPreferenceKey: PreferenceKey {
 
 private enum AgentChatEvent: Identifiable, Equatable {
     case agent(InteractionMessage)
+    case transcript(AgentEvent)
     case user(UserInteractionMessage)
 
     var id: String {
         switch self {
         case let .agent(message): "agent-\(message.id)"
+        case let .transcript(message): "transcript-\(message.id)"
         case let .user(message): "user-\(message.id)"
         }
     }
@@ -573,19 +648,27 @@ private enum AgentChatEvent: Identifiable, Equatable {
     var createdAt: Date {
         switch self {
         case let .agent(message): message.createdAt
+        case let .transcript(message): message.createdAt
         case let .user(message): message.sentAt
         }
     }
 
     var sortRank: Int {
         switch self {
+        case let .transcript(message):
+            switch message.role {
+            case .system: 0
+            case .agent: 1
+            case .user: 2
+            }
         case .agent: 0
-        case .user: 1
+        case .user: 2
         }
     }
 
     var isUserMessage: Bool {
         if case .user = self { return true }
+        if case let .transcript(message) = self, message.role == .user { return true }
         return false
     }
 
@@ -596,6 +679,15 @@ private enum AgentChatEvent: Identifiable, Equatable {
                 id,
                 message.kind.rawValue,
                 message.priority.rawValue,
+                message.title,
+                message.body,
+                message.createdAt.timeIntervalSince1970.description
+            ].joined(separator: "\u{1e}")
+        case let .transcript(message):
+            [
+                id,
+                message.role.rawValue,
+                message.kind.rawValue,
                 message.title,
                 message.body,
                 message.createdAt.timeIntervalSince1970.description
@@ -1683,8 +1775,12 @@ private struct ConversationStatusLine: View {
     let status: PaneStatus
     let updatedAt: Date
     let isLiveServer: Bool
+    let sourceAgent: String?
+    let hasTranscript: Bool
 
     private var agentLabel: String {
+        if sourceAgent == "claude" { return "Claude Code" }
+        if sourceAgent == "codex" { return "Codex" }
         if session.hasPrefix("cc_") { return "Claude Code" }
         if session.hasPrefix("cx_") { return "Codex" }
         return "Agent"
@@ -1709,9 +1805,14 @@ private struct ConversationStatusLine: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(.primary)
 
-                Text(updatedAt, style: .relative)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                HStack(spacing: 5) {
+                    Text(updatedAt, style: .relative)
+                    if hasTranscript {
+                        Text("transcript")
+                    }
+                }
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
             }
 
             Spacer()
@@ -1739,6 +1840,10 @@ private struct UserInteractionMessage: Identifiable, Equatable {
     let id = UUID()
     let text: String
     let sentAt: Date
+
+    var eventMatchId: String {
+        normalizedEventMatchText(text)
+    }
 }
 
 private struct AgentMessageBubble: View {
@@ -1835,6 +1940,130 @@ private struct AgentMessageBubble: View {
     }
 }
 
+private struct TranscriptAgentBubble: View {
+    let session: String
+    let status: PaneStatus
+    let event: AgentEvent
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            AgentAvatar(session: session, size: event.kind == .text ? 36 : 28)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: iconName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(tint)
+                    Text(event.title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(tint)
+                        .lineLimit(1)
+                    Text(event.createdAt, style: .relative)
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+
+                Text(event.body)
+                    .font(.system(size: event.kind == .text ? 15 : 13))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, event.kind == .text ? 14 : 12)
+            .padding(.vertical, event.kind == .text ? 12 : 9)
+            .background(background)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            Spacer(minLength: 28)
+        }
+    }
+
+    private var tint: Color {
+        switch event.kind {
+        case .toolCall:
+            return .blue
+        case .toolResult:
+            return event.status == "error" ? .red : .secondary
+        case .turn, .status:
+            return statusColor(status)
+        case .text:
+            return statusColor(status)
+        }
+    }
+
+    private var background: Color {
+        switch event.kind {
+        case .toolCall, .toolResult:
+            return Color(.secondarySystemBackground)
+        default:
+            return Color(.systemBackground)
+        }
+    }
+
+    private var iconName: String {
+        switch event.kind {
+        case .toolCall: "terminal"
+        case .toolResult: event.status == "error" ? "exclamationmark.triangle" : "checkmark.circle"
+        case .turn: "arrow.triangle.2.circlepath"
+        case .status: "info.circle"
+        case .text: "message"
+        }
+    }
+}
+
+private struct TranscriptUserBubble: View {
+    let event: AgentEvent
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            Spacer(minLength: 44)
+
+            VStack(alignment: .trailing, spacing: 5) {
+                Text(event.body)
+                    .font(.system(size: 15))
+                    .foregroundColor(.white)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(event.createdAt, style: .time)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.72))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color.accentColor)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+    }
+}
+
+private struct TranscriptSystemEventRow: View {
+    let event: AgentEvent
+
+    var body: some View {
+        HStack {
+            Spacer()
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color.secondary.opacity(0.6))
+                    .frame(width: 5, height: 5)
+                Text(systemText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color(.tertiarySystemFill), in: Capsule())
+            Spacer()
+        }
+    }
+
+    private var systemText: String {
+        event.body.isEmpty ? event.title : "\(event.title) · \(event.body)"
+    }
+}
+
 private struct UserMessageBubble: View {
     let message: UserInteractionMessage
 
@@ -1891,6 +2120,19 @@ private enum AgentPromptText {
         if lower.hasPrefix("working on ") && lower.split(separator: " ").count <= 4 { return true }
         return false
     }
+}
+
+private extension AgentEvent {
+    var localMatchId: String {
+        normalizedEventMatchText(body)
+    }
+}
+
+private func normalizedEventMatchText(_ value: String) -> String {
+    value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
 }
 
 private enum LocalSummary {

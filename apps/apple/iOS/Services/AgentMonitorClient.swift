@@ -131,6 +131,24 @@ struct AgentMonitorClient {
         return try Self.decode(PaneContextResponse.self, from: data)
     }
 
+    func paneEvents(for pane: Pane, limit: Int = 140) async throws -> AgentEventsResponse {
+        var components = try components(path: "/api/pane/events")
+        components.queryItems = [
+            URLQueryItem(name: "paneId", value: pane.id),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        guard let url = components.url else { throw AgentMonitorError.invalidServerURL }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+        setAuthorizationHeader(on: &request)
+
+        let (data, response) = try await session.data(for: request)
+        try validate(response)
+        return try Self.decode(AgentEventsResponse.self, from: data)
+    }
+
     func snapshotWebSocketRequest() throws -> URLRequest {
         var components = try components(path: "/ws")
         components.scheme = baseURL.scheme == "https" ? "wss" : "ws"
