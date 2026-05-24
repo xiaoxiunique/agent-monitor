@@ -56,6 +56,11 @@ type TranscriptFile = {
 };
 
 type RawEvent = Omit<AgentTimelineEvent, "id" | "paneId">;
+type ToolCallContext = {
+  toolName: string;
+  title: string;
+  body: string;
+};
 
 const maxTranscriptReadBytes = 8 * 1024 * 1024;
 const maxDiscoveryFiles = 140;
@@ -233,14 +238,21 @@ async function bestTranscriptCandidate(
 async function scoreClaudeTranscript(path: string, cwd: string): Promise<number> {
   const sample = await readFileTail(path, 512 * 1024);
   if (sample.includes(jsonField("cwd", cwd))) return 100;
-  return sample.includes(cwd) ? 50 : 1;
+  if (isSpecificWorkingDirectory(cwd) && sample.includes(cwd)) return 50;
+  return 1;
 }
 
 async function scoreCodexTranscript(path: string, cwd: string): Promise<number> {
   const sample = await readFileHead(path, 256 * 1024);
   if (sample.includes(jsonField("cwd", cwd))) return 100;
-  if (sample.includes(cwd)) return 50;
+  if (isSpecificWorkingDirectory(cwd) && sample.includes(cwd)) return 50;
   return 0;
+}
+
+function isSpecificWorkingDirectory(cwd: string): boolean {
+  const normalized = cwd.replace(/\/+$/, "");
+  if (!normalized || normalized === "/" || normalized === homedir()) return false;
+  return normalized.split("/").filter(Boolean).length >= 4;
 }
 
 function encodeClaudeProjectPath(cwd: string): string {
@@ -313,6 +325,9 @@ async function safeStat(path: string) {
 
 function parseClaudeEvents(text: string): RawEvent[] {
   const events: RawEvent[] = [];
+  const hiddenCallIds = new Set<string>();
+  const quietCallIds = new Set<string>();
+  const toolCallContexts = new Map<string, ToolCallContext>();
 
   for (const item of parseJsonLines(text)) {
     const timestamp = timestampOrNow(item.timestamp);
@@ -325,7 +340,7 @@ function parseClaudeEvents(text: string): RawEvent[] {
     if (role !== "user" && role !== "assistant") continue;
 
     if (role === "user") {
-      const parsed = extractClaudeContent(content);
+      const parsed = extractClaudeContent(content, toolCallContexts);
       if (parsed.text) {
         events.push({
           role: "user",
@@ -336,6 +351,8 @@ function parseClaudeEvents(text: string): RawEvent[] {
         });
       }
       for (const result of parsed.toolResults) {
+        if (hiddenCallIds.has(result.callId)) continue;
+        if (quietCallIds.has(result.callId) && result.status !== "error") continue;
         events.push({
           role: "agent",
           kind: "tool_result",
@@ -349,7 +366,7 @@ function parseClaudeEvents(text: string): RawEvent[] {
       continue;
     }
 
-    const parsed = extractClaudeContent(content);
+    const parsed = extractClaudeContent(content, toolCallContexts);
     if (parsed.text) {
       events.push({
         role: "agent",
@@ -360,6 +377,21 @@ function parseClaudeEvents(text: string): RawEvent[] {
       });
     }
     for (const call of parsed.toolCalls) {
+      if (isHiddenTool(call.toolName)) {
+        if (call.callId) hiddenCallIds.add(call.callId);
+        continue;
+      }
+      if (call.callId) {
+        toolCallContexts.set(call.callId, {
+          toolName: call.toolName,
+          title: call.title,
+          body: call.body,
+        });
+      }
+      if (isQuietToolCall(call.toolName, call)) {
+        if (call.callId) quietCallIds.add(call.callId);
+        continue;
+      }
       events.push({
         role: "agent",
         kind: "tool_call",
@@ -377,6 +409,9 @@ function parseClaudeEvents(text: string): RawEvent[] {
 
 function parseCodexEvents(text: string): RawEvent[] {
   const events: RawEvent[] = [];
+  const hiddenCallIds = new Set<string>();
+  const quietCallIds = new Set<string>();
+  const toolCallContexts = new Map<string, ToolCallContext>();
 
   for (const item of parseJsonLines(text)) {
     const timestamp = timestampOrNow(item.timestamp);
@@ -408,24 +443,8 @@ function parseCodexEvents(text: string): RawEvent[] {
             createdAt: timestamp,
           });
         }
-      } else if (eventType === "task_started") {
-        events.push({
-          role: "system",
-          kind: "turn",
-          title: "Turn started",
-          body: "Agent started working on a new instruction.",
-          createdAt: timestamp,
-          status: "started",
-        });
-      } else if (eventType === "task_complete") {
-        events.push({
-          role: "system",
-          kind: "turn",
-          title: "Turn complete",
-          body: formatDuration(Number(payload.duration_ms)),
-          createdAt: timestamp,
-          status: "complete",
-        });
+      } else if (eventType === "task_started" || eventType === "task_complete") {
+        continue;
       } else if (eventType === "turn_aborted") {
         events.push({
           role: "system",
@@ -444,8 +463,24 @@ function parseCodexEvents(text: string): RawEvent[] {
     const payloadType = stringValue(payload.type);
     if (payloadType === "function_call") {
       const name = stringValue(payload.name) || "tool";
+      const callId = stringValue(payload.call_id);
+      if (isHiddenTool(name)) {
+        if (callId) hiddenCallIds.add(callId);
+        continue;
+      }
       const args = parseMaybeJson(stringValue(payload.arguments));
       const formatted = formatToolCall(name, args);
+      if (callId) {
+        toolCallContexts.set(callId, {
+          toolName: name,
+          title: formatted.title,
+          body: formatted.body,
+        });
+      }
+      if (isQuietToolCall(name, formatted)) {
+        if (callId) quietCallIds.add(callId);
+        continue;
+      }
       events.push({
         role: "agent",
         kind: "tool_call",
@@ -453,19 +488,26 @@ function parseCodexEvents(text: string): RawEvent[] {
         body: formatted.body,
         createdAt: timestamp,
         toolName: name,
-        callId: stringValue(payload.call_id),
+        callId,
       });
     } else if (payloadType === "function_call_output") {
-      const body = summarizeToolOutput(stringValue(payload.output));
+      const callId = stringValue(payload.call_id);
+      if (callId && hiddenCallIds.has(callId)) continue;
+      const body = summarizeToolOutput(
+        stringValue(payload.output),
+        callId ? toolCallContexts.get(callId) : undefined,
+      );
       if (body) {
+        const status = inferToolOutputStatus(body);
+        if (callId && quietCallIds.has(callId) && status !== "error") continue;
         events.push({
           role: "agent",
           kind: "tool_result",
           title: "Tool result",
           body,
           createdAt: timestamp,
-          callId: stringValue(payload.call_id),
-          status: inferToolOutputStatus(body),
+          callId,
+          status,
         });
       }
     } else if (payloadType === "message") {
@@ -486,7 +528,7 @@ function parseCodexEvents(text: string): RawEvent[] {
   return events;
 }
 
-function extractClaudeContent(content: unknown): {
+function extractClaudeContent(content: unknown, toolContexts?: Map<string, ToolCallContext>): {
   text: string;
   toolCalls: Array<{ callId: string; toolName: string; title: string; body: string }>;
   toolResults: Array<{ callId: string; title: string; body: string; status?: string }>;
@@ -524,10 +566,11 @@ function extractClaudeContent(content: unknown): {
         body: formatted.body,
       });
     } else if (type === "tool_result") {
-      const body = summarizeToolOutput(extractClaudeToolResultText(item.content));
+      const callId = stringValue(item.tool_use_id);
+      const body = summarizeToolOutput(extractClaudeToolResultText(item.content), toolContexts?.get(callId));
       if (body) {
         toolResults.push({
-          callId: stringValue(item.tool_use_id),
+          callId,
           title: "Tool result",
           body,
           status: stringValue(item.is_error) === "true" ? "error" : inferToolOutputStatus(body),
@@ -572,65 +615,211 @@ function extractClaudeToolResultText(content: unknown): string {
 }
 
 function formatToolCall(toolName: string, input: unknown): { title: string; body: string } {
+  const normalizedToolName = normalizeToolName(toolName);
   const item = objectValue(input);
   const value = (key: string) => item ? stringValue(item[key]) : "";
 
-  switch (toolName) {
-  case "Bash":
+  switch (normalizedToolName) {
   case "bash":
   case "run_command":
   case "exec_command": {
     const command = value("command") || value("cmd");
-    const workdir = value("workdir");
     const description = value("description");
     return {
       title: description ? `Run: ${description}` : "Run command",
-      body: [workdir ? `cd ${workdir}` : "", command ? `$ ${command}` : compactJson(input)]
-        .filter(Boolean)
-        .join("\n"),
+      body: command ? `$ ${command}` : compactJson(input),
     };
   }
-  case "Read":
   case "read":
   case "read_file":
     return { title: "Read file", body: value("file_path") || value("path") || compactJson(input) };
-  case "Edit":
-  case "MultiEdit":
-  case "Write":
   case "edit":
+  case "multiedit":
   case "write":
   case "apply_patch":
-    return { title: `${toolName} file`, body: value("file_path") || value("path") || compactJson(input) };
-  case "Grep":
+    return { title: "Edit files", body: summarizePatchInput(input) || value("file_path") || value("path") || compactJson(input) };
   case "grep":
-  case "Glob":
   case "glob":
   case "find":
     return { title: toolName, body: value("pattern") || value("query") || value("path") || compactJson(input) };
+  case "view_image":
+    return { title: "View image", body: value("path") || compactJson(input) };
+  case "askuserquestion":
+  case "ask_user_question":
+    return { title: "Asked a question", body: summarizeQuestionInput(input) || compactJson(input) };
   case "open":
-  case "web.run":
+  case "run":
     return { title: "Use web", body: compactJson(input) };
   default:
     return { title: toolName, body: compactJson(input) || "Tool call started." };
   }
 }
 
-function summarizeToolOutput(output: string): string {
+function isHiddenTool(toolName: string): boolean {
+  switch (normalizeToolName(toolName)) {
+  case "update_plan":
+  case "get_goal":
+  case "create_goal":
+  case "update_goal":
+  case "write_stdin":
+  case "todowrite":
+  case "todo_write":
+    return true;
+  default:
+    return false;
+  }
+}
+
+function isQuietToolCall(toolName: string, formatted: { title: string; body: string }): boolean {
+  const normalizedToolName = normalizeToolName(toolName);
+  if (normalizedToolName === "read" || normalizedToolName === "read_file") return true;
+  if (normalizedToolName === "grep" || normalizedToolName === "glob" || normalizedToolName === "find") return true;
+  if (normalizedToolName === "open" || normalizedToolName === "run" || normalizedToolName === "view_image") return true;
+  if (normalizedToolName !== "bash" && normalizedToolName !== "run_command" && normalizedToolName !== "exec_command") {
+    return false;
+  }
+
+  const command = commandFromFormattedToolBody(formatted.body).trim();
+  return Boolean(command);
+}
+
+function normalizeToolName(toolName: string): string {
+  return toolName.trim().toLowerCase().replace(/^functions\./, "").replace(/^web\./, "");
+}
+
+function commandFromToolContext(context?: ToolCallContext): string {
+  return commandFromFormattedToolBody(context?.body ?? "");
+}
+
+function commandFromFormattedToolBody(body: string): string {
+  const commandLine = body
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("$ "));
+  return commandLine ? commandLine.slice(2).trim() : "";
+}
+
+function summarizePatchInput(input: unknown): string {
+  if (typeof input !== "string") return "";
+  const updates = [...input.matchAll(/^\*\*\* Update File:\s+(.+)$/gm)].map((match) => match[1]);
+  const adds = [...input.matchAll(/^\*\*\* Add File:\s+(.+)$/gm)].map((match) => match[1]);
+  const deletes = [...input.matchAll(/^\*\*\* Delete File:\s+(.+)$/gm)].map((match) => match[1]);
+  const parts = [
+    ...updates.map((path) => `Updated ${path}`),
+    ...adds.map((path) => `Added ${path}`),
+    ...deletes.map((path) => `Deleted ${path}`),
+  ];
+  return parts.slice(0, 4).join("\n");
+}
+
+function summarizeQuestionInput(input: unknown): string {
+  const item = objectValue(input);
+  const questions = Array.isArray(item?.questions) ? item.questions : [];
+  return questions
+    .map((question) => objectValue(question))
+    .map((question) => stringValue(question?.question))
+    .filter(Boolean)
+    .slice(0, 3)
+    .join("\n");
+}
+
+function summarizeToolOutput(output: string, context?: ToolCallContext): string {
   const cleaned = cleanBody(output);
   if (!cleaned) return "";
 
   const marker = "\nOutput:\n";
   const outputIndex = cleaned.lastIndexOf(marker);
   const body = outputIndex >= 0 ? cleaned.slice(outputIndex + marker.length).trim() : cleaned;
-  const header = outputIndex >= 0 ? cleaned.slice(0, outputIndex).trim() : "";
-  const lines = body.split("\n").filter((line) => line.trim().length > 0);
+  const lines = body
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .filter((line) => !isToolOutputMetadataLine(line));
+  const exitCode = extractToolExitCode(cleaned);
+  const command = commandFromToolContext(context);
 
-  if (lines.length === 0) {
-    const statusLine = header.split("\n").find((line) => /process exited|process running|wall time/i.test(line));
-    return statusLine ? cleanBody(statusLine) : "";
+  if (exitCode !== undefined && exitCode !== 0) {
+    if (isExpectedEmptyFailure(command, exitCode, lines)) return "";
+    return truncateText([
+      `Process exited with code ${exitCode}.`,
+      command ? `$ ${command}` : "",
+      ...lines.slice(0, 10),
+    ].filter(Boolean).join("\n"), 1200);
   }
 
-  return truncateText(lines.slice(0, 12).join("\n"), 1200);
+  const successSummary = summarizeSuccessfulCommand(command, lines);
+  if (successSummary) return successSummary;
+
+  if (lines.length === 0) return "";
+  if (isRoutineSuccessfulOutput(command, lines)) return "";
+
+  const highlighted = summarizeRecognizedOutput(lines);
+  if (highlighted) return highlighted;
+
+  return truncateText(lines.slice(0, 4).join("\n"), 800);
+}
+
+function isExpectedEmptyFailure(command: string, exitCode: number, lines: string[]): boolean {
+  if (exitCode !== 1 || lines.length > 0) return false;
+  const normalized = command.trim().toLowerCase();
+  return /^(rg|grep)\b/.test(normalized);
+}
+
+function isToolOutputMetadataLine(line: string): boolean {
+  return /^Chunk ID:/i.test(line)
+    || /^Wall time:/i.test(line)
+    || /^Original token count:/i.test(line)
+    || /^Process (running with session ID|exited with code)/i.test(line)
+    || /^Output:$/i.test(line)
+    || /^Total output lines:/i.test(line);
+}
+
+function extractToolExitCode(output: string): number | undefined {
+  const match = output.match(/Process exited with code\s+(-?\d+)/i);
+  return match ? Number(match[1]) : undefined;
+}
+
+function isRoutineSuccessfulOutput(command: string, lines: string[]): boolean {
+  if (!command) return false;
+  const normalized = command.toLowerCase();
+  if (/^(sed|cat|nl|head|tail|rg|grep|find|ls|pwd|wc|lsof|tmux)\b/.test(normalized)) return true;
+  if (/^curl\b/.test(normalized)) return true;
+  if (/^node\s+-e\b/.test(normalized)) return true;
+  if (/^git\s+status\b/.test(normalized)) return true;
+  if (/^git\s+(diff|log|show|rev-parse|branch)\b/.test(normalized)) return true;
+  if (/^git\s+commit\b/.test(normalized)) return false;
+  return lines.length === 0;
+}
+
+function summarizeRecognizedOutput(lines: string[]): string {
+  const output = lines.join("\n");
+  if (/BUILD SUCCEEDED/i.test(output)) return "Build succeeded.";
+  if (/BUILD FAILED/i.test(output)) return truncateText(output, 1000);
+  if (/Everything up-to-date/i.test(output)) return "Everything is up to date.";
+  if (/^\?\?\s/m.test(output) && lines.every((line) => line.trim().startsWith("?? "))) {
+    return `Git status: ${lines.length} untracked item${lines.length === 1 ? "" : "s"}.`;
+  }
+  return "";
+}
+
+function summarizeSuccessfulCommand(command: string, lines: string[]): string {
+  if (!command) return "";
+  const normalized = command.toLowerCase();
+  const output = lines.join("\n");
+
+  if (/npm run check\b|tsc\s+--noemit/.test(normalized)) return "Type check passed.";
+  if (/cargo check\b|npm run check:rust\b/.test(normalized)) return "Rust check passed.";
+  if (/npm run build:ios\b|xcodebuild\b/.test(normalized)) {
+    return /build succeeded/i.test(output) ? "iOS build succeeded." : "iOS build completed.";
+  }
+  if (/npm run build:mac\b/.test(normalized)) return "macOS build completed.";
+  if (/git diff --check\b/.test(normalized)) return "Diff check passed.";
+  if (/git push\b/.test(normalized)) {
+    const usefulLines = lines.filter((line) => !/^to\s+/.test(line.trim().toLowerCase()));
+    return truncateText(usefulLines.slice(-4).join("\n") || "Pushed to remote.", 800);
+  }
+
+  return "";
 }
 
 function inferToolOutputStatus(body: string): string | undefined {
@@ -651,13 +840,6 @@ function codexPhaseTitle(phase: string): string {
   }
 }
 
-function formatDuration(durationMs: number): string {
-  if (!Number.isFinite(durationMs) || durationMs <= 0) return "Agent finished this turn.";
-  const seconds = Math.round(durationMs / 1000);
-  if (seconds < 60) return `Agent finished this turn in ${seconds}s.`;
-  return `Agent finished this turn in ${Math.floor(seconds / 60)}m ${seconds % 60}s.`;
-}
-
 function finalizeEvents(paneId: string, events: RawEvent[], limit: number): AgentTimelineEvent[] {
   const seen = new Map<string, number>();
   const out: AgentTimelineEvent[] = [];
@@ -666,14 +848,9 @@ function finalizeEvents(paneId: string, events: RawEvent[], limit: number): Agen
     const body = cleanBody(event.body);
     if (!body) return;
     const title = truncateText(cleanBody(event.title), 80) || defaultTitle(event);
-    const dedupeKey = [
-      event.role,
-      event.kind,
-      title,
-      normalizeForDedupe(body).slice(0, 500),
-    ].join("\u{1f}");
+    const dedupeKey = eventDedupeKey(event, title, body);
     const previousIndex = seen.get(dedupeKey);
-    if (previousIndex !== undefined && index - previousIndex < 8) return;
+    if (previousIndex !== undefined && index - previousIndex < 20) return;
     seen.set(dedupeKey, index);
 
     out.push({
@@ -693,6 +870,22 @@ function defaultTitle(event: RawEvent): string {
   if (event.kind === "tool_result") return "Tool result";
   if (event.kind === "turn") return "Turn";
   return event.role === "user" ? "You" : "Agent";
+}
+
+function eventDedupeKey(event: RawEvent, title: string, body: string): string {
+  const normalizedBody = normalizeForDedupe(body).slice(0, 500);
+  if (event.kind === "text") {
+    return [event.role, event.kind, normalizedBody].join("\u{1f}");
+  }
+  if (event.kind === "tool_result" && event.callId) {
+    return [event.kind, event.callId, normalizedBody].join("\u{1f}");
+  }
+  return [
+    event.role,
+    event.kind,
+    title,
+    normalizedBody,
+  ].join("\u{1f}");
 }
 
 function parseJsonLines(text: string): Record<string, unknown>[] {

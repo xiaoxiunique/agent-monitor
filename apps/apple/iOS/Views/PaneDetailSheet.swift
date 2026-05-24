@@ -313,11 +313,16 @@ private struct AgentChatTimelineContainer: View {
                             case .user:
                                 TranscriptUserBubble(event: message)
                             case .agent:
-                                TranscriptAgentBubble(
-                                    session: currentPane.session,
-                                    status: currentPane.status,
-                                    event: message
-                                )
+                                switch message.kind {
+                                case .toolCall, .toolResult:
+                                    TranscriptToolEventRow(event: message)
+                                default:
+                                    TranscriptAgentBubble(
+                                        session: currentPane.session,
+                                        status: currentPane.status,
+                                        event: message
+                                    )
+                                }
                             case .system:
                                 TranscriptSystemEventRow(event: message)
                             }
@@ -2004,6 +2009,66 @@ private struct TranscriptAgentBubble: View {
         case .turn: "arrow.triangle.2.circlepath"
         case .status: "info.circle"
         case .text: "message"
+        }
+    }
+}
+
+private struct TranscriptToolEventRow: View {
+    let event: AgentEvent
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: iconName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(tint)
+                .frame(width: 18, height: 18)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(event.title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(tint)
+                    .lineLimit(1)
+
+                if !event.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(event.body)
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(event.status == "error" ? 6 : 2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 46)
+        .padding(.trailing, 18)
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var tint: Color {
+        if event.status == "error" {
+            return .red
+        }
+        switch event.kind {
+        case .toolCall:
+            return .secondary
+        case .toolResult:
+            return .green
+        default:
+            return .secondary
+        }
+    }
+
+    private var iconName: String {
+        switch event.kind {
+        case .toolCall:
+            return "terminal"
+        case .toolResult:
+            return event.status == "error" ? "exclamationmark.triangle" : "checkmark.circle"
+        default:
+            return "info.circle"
         }
     }
 }
