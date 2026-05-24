@@ -285,13 +285,16 @@ private struct AgentChatTimelineContainer: View {
                     ConversationStatusLine(
                         session: currentPane.session,
                         status: currentPane.status,
-                        updatedAt: currentPane.updatedAt,
                         isLiveServer: isLiveServer,
                         sourceAgent: transcriptSource?.agent,
                         hasTranscript: !transcriptEvents.isEmpty
                     )
 
-                    ForEach(chatEvents) { event in
+                    ForEach(Array(chatEvents.enumerated()), id: \.element.id) { index, event in
+                        if shouldShowTimeDivider(before: event, at: index, in: chatEvents) {
+                            ChatTimeDivider(date: event.createdAt)
+                        }
+
                         switch event {
                         case let .agent(message):
                             AgentMessageBubble(
@@ -300,7 +303,6 @@ private struct AgentChatTimelineContainer: View {
                                 kind: message.kind,
                                 title: message.title,
                                 message: message.body,
-                                updatedAt: message.createdAt,
                                 actions: message.actions,
                                 actionsEnabled: isLiveServer,
                                 onOpenTerminal: onOpenTerminal,
@@ -614,6 +616,15 @@ private struct AgentChatTimelineContainer: View {
     private func eventFingerprint(for events: [AgentChatEvent]) -> String {
         events.map(\.fingerprint).joined(separator: "\u{1f}")
     }
+
+    private func shouldShowTimeDivider(before event: AgentChatEvent, at index: Int, in events: [AgentChatEvent]) -> Bool {
+        guard index > 0 else { return true }
+        let previous = events[index - 1]
+        if !Calendar.current.isDate(previous.createdAt, inSameDayAs: event.createdAt) {
+            return true
+        }
+        return event.createdAt.timeIntervalSince(previous.createdAt) >= 10 * 60
+    }
 }
 
 private struct ChatTailPositionPreferenceKey: PreferenceKey {
@@ -740,7 +751,6 @@ private struct PaneRealtimeLogContainer: View {
             status: displayStatus,
             reason: displayReason,
             logText: displayLogText,
-            updatedAt: displayUpdatedAt,
             followTailRequest: followTailRequest,
             isUserScrolling: $isLogUserScrolling,
             isFollowingTail: $isLogFollowingTail
@@ -938,7 +948,6 @@ private struct RealtimeLogPanel: View {
     let status: PaneStatus
     let reason: String
     let logText: String
-    let updatedAt: Date
     let followTailRequest: Int
     @Binding var isUserScrolling: Bool
     @Binding var isFollowingTail: Bool
@@ -960,10 +969,6 @@ private struct RealtimeLogPanel: View {
                         .foregroundColor(.white.opacity(0.56))
                         .lineLimit(1)
                 }
-
-                Text(updatedAt, style: .relative)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.48))
 
                 Spacer()
             }
@@ -1773,7 +1778,6 @@ private enum LogText {
 private struct ConversationStatusLine: View {
     let session: String
     let status: PaneStatus
-    let updatedAt: Date
     let isLiveServer: Bool
     let sourceAgent: String?
     let hasTranscript: Bool
@@ -1806,7 +1810,7 @@ private struct ConversationStatusLine: View {
                     .foregroundColor(.primary)
 
                 HStack(spacing: 5) {
-                    Text(updatedAt, style: .relative)
+                    Text(isLiveServer ? "Live status" : "Snapshot")
                     if hasTranscript {
                         Text("transcript")
                     }
@@ -1852,7 +1856,6 @@ private struct AgentMessageBubble: View {
     let kind: InteractionMessageKind?
     let title: String?
     let message: String
-    let updatedAt: Date
     var actions: [InteractionAction]?
     var actionsEnabled = true
     var onOpenTerminal: () -> Void
@@ -1870,9 +1873,6 @@ private struct AgentMessageBubble: View {
                     Text(title?.isEmpty == false ? title! : status.title)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(tint)
-                    Text(updatedAt, style: .relative)
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
                 }
 
                 Text(message)
@@ -1958,9 +1958,6 @@ private struct TranscriptAgentBubble: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(tint)
                         .lineLimit(1)
-                    Text(event.createdAt, style: .relative)
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
                 }
 
                 Text(event.body)
@@ -2024,10 +2021,6 @@ private struct TranscriptUserBubble: View {
                     .foregroundColor(.white)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
-
-                Text(event.createdAt, style: .time)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.72))
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -2076,16 +2069,67 @@ private struct UserMessageBubble: View {
                     .font(.system(size: 15))
                     .foregroundColor(.white)
                     .fixedSize(horizontal: false, vertical: true)
-
-                Text(message.sentAt, style: .time)
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.72))
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(Color.accentColor)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
+    }
+}
+
+private struct ChatTimeDivider: View {
+    let date: Date
+
+    var body: some View {
+        HStack {
+            Spacer()
+            Text(ChatTimeFormatter.dividerText(for: date))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color(.tertiarySystemFill), in: Capsule())
+            Spacer()
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private enum ChatTimeFormatter {
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateFormat = "MMM d HH:mm"
+        return formatter
+    }()
+
+    private static let yearFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    static func dividerText(for date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return timeFormatter.string(from: date)
+        }
+        if calendar.isDateInYesterday(date) {
+            return "Yesterday \(timeFormatter.string(from: date))"
+        }
+        if calendar.component(.year, from: date) == calendar.component(.year, from: Date()) {
+            return dayFormatter.string(from: date)
+        }
+        return yearFormatter.string(from: date)
     }
 }
 

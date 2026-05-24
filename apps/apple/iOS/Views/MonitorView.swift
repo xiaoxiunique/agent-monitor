@@ -451,8 +451,11 @@ private struct MachineCard: View {
     }
 
     private var detail: String {
+        if state.connectionState == "live" || state.connectionState == "reconnecting" {
+            return profile.trimmedURL.isEmpty ? "Connected" : profile.trimmedURL
+        }
         if let lastSeenAt = state.lastSeenAt {
-            return "Last seen \(lastSeenAt.formatted(.relative(presentation: .numeric)))"
+            return "Last seen \(StableTimeFormatter.shortDateTime(lastSeenAt))"
         }
         if let error = state.errorMessage, !error.isEmpty {
             return error
@@ -561,6 +564,40 @@ private struct WorkSessionStatusStrip: View {
 
     private func count(_ status: PaneStatus) -> Int {
         panes.filter { $0.status == status }.count
+    }
+}
+
+private enum StableTimeFormatter {
+    private static let todayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    private static let recentFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateFormat = "MMM d HH:mm"
+        return formatter
+    }()
+
+    private static let fullFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    static func shortDateTime(_ date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return todayFormatter.string(from: date)
+        }
+        if calendar.component(.year, from: date) == calendar.component(.year, from: Date()) {
+            return recentFormatter.string(from: date)
+        }
+        return fullFormatter.string(from: date)
     }
 }
 
