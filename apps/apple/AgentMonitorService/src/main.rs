@@ -218,6 +218,7 @@ struct TerminalMessage {
     data: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    lines: Option<i32>,
 }
 
 enum TerminalEvent {
@@ -299,6 +300,45 @@ fn run_tmux(args: &[String]) -> Result<TmuxOutput, String> {
     Ok(TmuxOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
     })
+}
+
+fn scroll_tmux_pane(pane_id: &str, lines: i32) {
+    if pane_id.is_empty() {
+        return;
+    }
+    let safe_lines = lines.clamp(-200, 200);
+    if safe_lines == 0 {
+        return;
+    }
+
+    let _ = run_tmux(&["copy-mode".to_string(), "-t".to_string(), pane_id.to_string()]);
+    let direction = if safe_lines > 0 {
+        "scroll-up"
+    } else {
+        "scroll-down"
+    };
+    let _ = run_tmux(&[
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "-X".to_string(),
+        "-N".to_string(),
+        safe_lines.abs().to_string(),
+        direction.to_string(),
+    ]);
+}
+
+fn exit_tmux_copy_mode(pane_id: &str) {
+    if pane_id.is_empty() {
+        return;
+    }
+    let _ = run_tmux(&[
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "-X".to_string(),
+        "cancel".to_string(),
+    ]);
 }
 
 fn is_no_tmux_server_error(error: &str) -> bool {
@@ -2278,13 +2318,13 @@ async fn handle_terminal_socket(mut socket: WebSocket, query: HashMap<String, St
                 match message {
                     Message::Text(text) => {
                         if let Ok(message) = serde_json::from_str::<TerminalMessage>(&text) {
-                            handle_terminal_message(message, &pair.master, &mut writer);
+                            handle_terminal_message(message, &pane_id, &pair.master, &mut writer);
                         }
                     }
                     Message::Binary(bytes) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                             if let Ok(message) = serde_json::from_str::<TerminalMessage>(&text) {
-                                handle_terminal_message(message, &pair.master, &mut writer);
+                                handle_terminal_message(message, &pane_id, &pair.master, &mut writer);
                             }
                         }
                     }
@@ -2323,12 +2363,14 @@ async fn collect_terminal_output(
 
 fn handle_terminal_message(
     message: TerminalMessage,
+    pane_id: &str,
     master: &Box<dyn portable_pty::MasterPty + Send>,
     writer: &mut Box<dyn Write + Send>,
 ) {
     match message.message_type.as_deref() {
         Some("input") => {
             if let Some(data) = message.data {
+                exit_tmux_copy_mode(pane_id);
                 let _ = writer.write_all(data.as_bytes());
                 let _ = writer.flush();
             }
@@ -2341,6 +2383,11 @@ fn handle_terminal_message(
                     pixel_width: 0,
                     pixel_height: 0,
                 });
+            }
+        }
+        Some("scroll") => {
+            if let Some(lines) = message.lines {
+                scroll_tmux_pane(pane_id, lines);
             }
         }
         _ => {}

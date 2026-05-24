@@ -43,9 +43,13 @@ struct SwiftTermView: UIViewRepresentable {
         tv.nativeForegroundColor = UIColor(red: 0.86, green: 0.90, blue: 0.82, alpha: 1)
         tv.caretColor = UIColor(red: 0.616, green: 0.878, blue: 0.482, alpha: 1)
         tv.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        tv.alwaysBounceVertical = true
+        tv.keyboardDismissMode = .interactive
+        tv.allowMouseReporting = false
 
         tv.terminalDelegate = context.coordinator
         context.coordinator.terminalView = tv
+        context.coordinator.installScrollGesture(on: tv)
 
         service.onData = { [weak tv] text in
             tv?.feed(text: text)
@@ -89,9 +93,48 @@ struct SwiftTermView: UIViewRepresentable {
         // Safe: TerminalViewDelegate is called on main thread, service is @MainActor
         let service: TerminalWebSocketService
         weak var terminalView: TerminalView?
+        private var scrollGesture: UIPanGestureRecognizer?
+        private var pendingScrollDelta: CGFloat = 0
 
         init(service: TerminalWebSocketService) {
             self.service = service
+        }
+
+        @MainActor
+        func installScrollGesture(on terminalView: TerminalView) {
+            let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
+            gesture.cancelsTouchesInView = false
+            gesture.delegate = self
+            terminalView.addGestureRecognizer(gesture)
+            scrollGesture = gesture
+        }
+
+        @MainActor
+        @objc private func handleScrollPan(_ gesture: UIPanGestureRecognizer) {
+            guard let terminalView = terminalView else { return }
+            let translation = gesture.translation(in: terminalView)
+            gesture.setTranslation(.zero, in: terminalView)
+
+            switch gesture.state {
+            case .began:
+                pendingScrollDelta = 0
+            case .changed:
+                let cellHeight = max(terminalView.caretFrame.height, 12)
+                pendingScrollDelta += translation.y / cellHeight
+                let wholeLines = Int(pendingScrollDelta)
+                guard wholeLines != 0 else { return }
+                pendingScrollDelta -= CGFloat(wholeLines)
+                sendScroll(lines: wholeLines)
+            case .ended, .cancelled, .failed:
+                pendingScrollDelta = 0
+            default:
+                break
+            }
+        }
+
+        private func sendScroll(lines: Int) {
+            let svc = service
+            MainActor.assumeIsolated { svc.sendScroll(lines: lines) }
         }
 
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
@@ -128,5 +171,14 @@ struct SwiftTermView: UIViewRepresentable {
         func clipboardRead(source: TerminalView) -> Data? { nil }
         func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
         func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+    }
+}
+
+extension SwiftTermView.Coordinator: UIGestureRecognizerDelegate {
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }

@@ -132,6 +132,28 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; er
   };
 }
 
+function scrollTmuxPane(paneId: string, lines: number): void {
+  if (!paneId || !Number.isFinite(lines)) return;
+  const safeLines = Math.max(-200, Math.min(200, Math.trunc(lines)));
+  if (safeLines === 0) return;
+
+  runTmux(["copy-mode", "-t", paneId]);
+  runTmux([
+    "send-keys",
+    "-t",
+    paneId,
+    "-X",
+    "-N",
+    String(Math.abs(safeLines)),
+    safeLines > 0 ? "scroll-up" : "scroll-down",
+  ]);
+}
+
+function exitTmuxCopyMode(paneId: string): void {
+  if (!paneId) return;
+  runTmux(["send-keys", "-t", paneId, "-X", "cancel"]);
+}
+
 type BasePane = Omit<Pane, "tail" | "status" | "reason" | "updatedAt" | "messages">;
 
 function listPanes(): { ok: true; panes: BasePane[] } | { ok: false; error: string } {
@@ -1352,7 +1374,7 @@ terminalWss.on("connection", (ws, req) => {
   });
 
   ws.on("message", (raw) => {
-    let message: { type?: string; data?: string; cols?: number; rows?: number } | null = null;
+    let message: { type?: string; data?: string; cols?: number; rows?: number; lines?: number } | null = null;
     try {
       message = JSON.parse(raw.toString());
     } catch {
@@ -1361,6 +1383,7 @@ terminalWss.on("connection", (ws, req) => {
     if (!message) return;
 
     if (message.type === "input" && typeof message.data === "string") {
+      exitTmuxCopyMode(pane.id);
       term.write(message.data);
       return;
     }
@@ -1370,6 +1393,11 @@ terminalWss.on("connection", (ws, req) => {
         Math.max(20, Math.min(240, Number(message.cols))),
         Math.max(8, Math.min(80, Number(message.rows))),
       );
+      return;
+    }
+
+    if (message.type === "scroll" && Number.isFinite(message.lines)) {
+      scrollTmuxPane(pane.id, Number(message.lines));
     }
   });
 

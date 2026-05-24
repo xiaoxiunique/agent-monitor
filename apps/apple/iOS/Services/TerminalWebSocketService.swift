@@ -78,6 +78,14 @@ final class TerminalWebSocketService {
         wsTask.send(.string(msg)) { _ in }
     }
 
+    func sendScroll(lines: Int) {
+        guard let wsTask, state == .connected || state == .connecting else { return }
+        let safeLines = max(-200, min(200, lines))
+        guard safeLines != 0 else { return }
+        let msg = "{\"type\":\"scroll\",\"lines\":\(safeLines)}"
+        wsTask.send(.string(msg)) { _ in }
+    }
+
     func disconnect() {
         receiveTask?.cancel()
         receiveTask = nil
