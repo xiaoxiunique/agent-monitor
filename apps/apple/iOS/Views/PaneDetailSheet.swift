@@ -318,6 +318,7 @@ private struct AgentChatTimelineContainer: View {
                         tail: currentPane.tail,
                         updatedAt: currentPane.updatedAt,
                         interpretedMessages: currentPane.messages ?? [],
+                        latestUserMessage: userMessages.last?.text,
                         isLiveServer: isLiveServer
                     )
 
@@ -417,9 +418,28 @@ private struct AgentChatTimelineContainer: View {
     }
 
     private func visibleAgentMessages(from messages: [InteractionMessage]) -> [InteractionMessage] {
-        messages.filter { message in
-            message.kind != .summary
-                && !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        messages.compactMap { message in
+            guard message.kind != .summary else { return nil }
+            guard let body = LocalSummary.displayBody(
+                for: message,
+                status: currentPane.status,
+                title: cleanTaskTitle(currentPane.title),
+                reason: currentPane.reason,
+                tail: currentPane.tail,
+                latestUserMessage: userMessages.last?.text
+            ) else { return nil }
+            return InteractionMessage(
+                id: message.id,
+                paneId: message.paneId,
+                role: message.role,
+                kind: message.kind,
+                priority: message.priority,
+                title: message.title,
+                body: body,
+                actions: message.actions,
+                source: message.source,
+                createdAt: message.createdAt
+            )
         }
     }
 
@@ -1753,6 +1773,7 @@ private struct AgentOverviewPanel: View {
     let tail: String
     let updatedAt: Date
     let interpretedMessages: [InteractionMessage]
+    let latestUserMessage: String?
     let isLiveServer: Bool
 
     init(
@@ -1763,6 +1784,7 @@ private struct AgentOverviewPanel: View {
         tail: String,
         updatedAt: Date,
         interpretedMessages: [InteractionMessage] = [],
+        latestUserMessage: String? = nil,
         isLiveServer: Bool = true
     ) {
         self.session = session
@@ -1772,6 +1794,7 @@ private struct AgentOverviewPanel: View {
         self.tail = tail
         self.updatedAt = updatedAt
         self.interpretedMessages = interpretedMessages
+        self.latestUserMessage = latestUserMessage
         self.isLiveServer = isLiveServer
     }
 
@@ -1797,18 +1820,32 @@ private struct AgentOverviewPanel: View {
 
     private var summaryText: String {
         if let message = interpretedMessages.first(where: { $0.kind == .summary }),
-           !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return message.body
+           let body = LocalSummary.displayBody(
+                for: message,
+                status: status,
+                title: cleanTitle,
+                reason: reason,
+                tail: tail,
+                latestUserMessage: latestUserMessage
+           ) {
+            return body
         }
-        return LocalSummary.recentWork(from: tail)
+        return LocalSummary.recentWork(from: tail, latestUserMessage: latestUserMessage)
     }
 
     private var currentStateText: String {
         if let message = interpretedMessages.first(where: { $0.kind != .summary && $0.kind != .notification }),
-           !message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return message.body
+           let body = LocalSummary.displayBody(
+                for: message,
+                status: status,
+                title: cleanTitle,
+                reason: reason,
+                tail: tail,
+                latestUserMessage: latestUserMessage
+           ) {
+            return body
         }
-        return LocalSummary.currentState(status: status, title: cleanTitle, reason: reason, tail: tail)
+        return LocalSummary.currentState(status: status, title: cleanTitle, reason: reason, tail: tail, latestUserMessage: latestUserMessage)
     }
 
     var body: some View {
@@ -2167,8 +2204,7 @@ private struct UserMessageBubble: View {
 
 private enum AgentPromptText {
     static func extract(from tail: String) -> String {
-        let lines = tail.split(separator: "\n", omittingEmptySubsequences: true)
-        for line in lines.reversed() {
+        for line in LocalSummary.cleanLines(from: tail, limit: 80).reversed() {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if isMeaningfulLine(trimmed) {
                 return String(trimmed)
@@ -2182,7 +2218,20 @@ private enum AgentPromptText {
         if line.allSatisfy({ "─━═— ".contains($0) }) { return false }
         if line.hasPrefix("--") { return false }
         if line.first.map({ (0x2800...0x28FF).contains($0.unicodeScalars.first?.value ?? 0) }) == true { return false }
+        if isLowInformationLine(line) { return false }
         return true
+    }
+
+    static func isLowInformationLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        if lower == "i" { return true }
+        if lower.contains("esc to interrupt") { return true }
+        if lower.contains("tab to queue message") { return true }
+        if lower.contains("context left") || lower.contains("context used") { return true }
+        if lower.contains("working (") || lower.contains("thinking (") || lower.contains("running (") { return true }
+        if lower.hasPrefix("latest checkpoint: tab to queue message") { return true }
+        if lower.hasPrefix("working on ") && lower.split(separator: " ").count <= 4 { return true }
+        return false
     }
 }
 
@@ -2192,14 +2241,47 @@ private enum LocalSummary {
             .map(shortLine)
     }
 
-    static func recentWork(from tail: String) -> String {
+    static func displayBody(
+        for message: InteractionMessage,
+        status: PaneStatus,
+        title: String,
+        reason: String,
+        tail: String,
+        latestUserMessage: String?
+    ) -> String? {
+        let body = message.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        if !isLowValueMessage(body, title: title) {
+            return body
+        }
+
+        switch message.kind {
+        case .summary:
+            return recentWork(from: tail, latestUserMessage: latestUserMessage)
+        case .progress, .status:
+            return currentState(status: status, title: title, reason: reason, tail: tail, latestUserMessage: latestUserMessage)
+        case .notification:
+            return feedback(status: status, title: title, reason: reason, tail: tail)
+        case .question, .permissionRequest, .error, .done:
+            let fallback = currentState(status: status, title: title, reason: reason, tail: tail, latestUserMessage: latestUserMessage)
+            return fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : fallback
+        }
+    }
+
+    static func recentWork(from tail: String, latestUserMessage: String? = nil) -> String {
+        if let request = latestUserRequest(latestUserMessage) {
+            return "User asked: \(request)"
+        }
+
         let keywordLines = meaningfulLines(from: tail, limit: 32)
             .filter { line in
                 let lower = line.lowercased()
                 return [
                     "succeeded", "passed", "finished", "completed", "done", "fixed",
                     "updated", "created", "generated", "built", "compiled", "checked",
-                    "installed", "launched", "failed", "error"
+                    "installed", "launched", "failed", "error", "bug", "issue", "problem",
+                    "warning", "修", "改", "问题", "不合理", "详情", "列表", "展示",
+                    "实现", "添加", "删除", "切换"
                 ].contains { lower.contains($0) }
             }
             .suffix(4)
@@ -2216,10 +2298,16 @@ private enum LocalSummary {
         return lines.map { "- \($0)" }.joined(separator: "\n")
     }
 
-    static func currentState(status: PaneStatus, title: String, reason: String, tail: String) -> String {
+    static func currentState(status: PaneStatus, title: String, reason: String, tail: String, latestUserMessage: String? = nil) -> String {
         switch status {
         case .running:
-            return title.isEmpty ? (reason.isEmpty ? "Working on the current task." : reason) : "Working on \(title)."
+            if let actionable = actionableLine(from: tail) {
+                return "Working through: \(actionable)"
+            }
+            if let request = latestUserRequest(latestUserMessage) {
+                return "Working through your request: \(request)"
+            }
+            return reason.isEmpty ? "Working on the current task." : reason
         case .waiting:
             let prompt = AgentPromptText.extract(from: tail)
             return prompt.isEmpty ? "Waiting for your input before it can continue." : prompt
@@ -2245,7 +2333,7 @@ private enum LocalSummary {
     static func feedback(status: PaneStatus, title: String, reason: String, tail: String) -> String {
         switch status {
         case .running:
-            let latest = meaningfulLines(from: tail, limit: 1).last
+            let latest = actionableLine(from: tail) ?? meaningfulLines(from: tail, limit: 1).last
             return latest.map { "Latest checkpoint: \($0)" }
                 ?? "The agent is still working. Feedback will update when the next checkpoint appears."
         case .waiting:
@@ -2259,18 +2347,56 @@ private enum LocalSummary {
         }
     }
 
-    private static func meaningfulLines(from tail: String, limit: Int) -> [String] {
+    static func cleanLines(from tail: String, limit: Int) -> [String] {
         var lines: [String] = []
         for rawLine in tail.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = cleanDisplayLine(String(rawLine))
                 .replacingOccurrences(of: #"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#, with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard AgentPromptText.isMeaningfulLine(line) else { continue }
+            guard !line.isEmpty else { continue }
             if lines.last != line {
                 lines.append(line)
             }
         }
         return Array(lines.suffix(limit))
+    }
+
+    private static func meaningfulLines(from tail: String, limit: Int) -> [String] {
+        cleanLines(from: tail, limit: limit)
+            .filter(AgentPromptText.isMeaningfulLine)
+    }
+
+    private static func actionableLine(from tail: String) -> String? {
+        meaningfulLines(from: tail, limit: 40)
+            .reversed()
+            .first { line in
+                let lower = line.lowercased()
+                return [
+                    "bug", "fix", "修", "问题", "不合理", "列表", "详情", "展示",
+                    "implement", "update", "change", "build", "test", "check",
+                    "error", "failed", "warning", "commit"
+                ].contains { lower.contains($0) }
+            }
+            .map(shortLine)
+    }
+
+    private static func latestUserRequest(_ message: String?) -> String? {
+        guard let message else { return nil }
+        let value = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return shortLine(value)
+    }
+
+    private static func isLowValueMessage(_ body: String, title: String) -> Bool {
+        let normalizedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerBody = normalizedBody.lowercased()
+        let lowerTitle = title.lowercased()
+        if AgentPromptText.isLowInformationLine(normalizedBody) { return true }
+        if !lowerTitle.isEmpty && lowerBody == "working on \(lowerTitle)." { return true }
+        if !lowerTitle.isEmpty && lowerBody == "finished \(lowerTitle)." { return true }
+        if lowerBody == "working on the current task." { return true }
+        if lowerBody == "latest checkpoint: tab to queue message" { return true }
+        return false
     }
 
     private static func cleanDisplayLine(_ line: String) -> String {

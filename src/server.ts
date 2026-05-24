@@ -291,6 +291,7 @@ function activityFingerprint(tail: string) {
     .filter((line) => !/^›\s/.test(line))
     .filter((line) => !/context\s+\d+(?:\.\d+)?%\s+used/i.test(line))
     .filter((line) => !/\b(working|thinking|running)\s*\([^)]*\).*(esc to interrupt|\/stop to close)/i.test(line))
+    .filter((line) => !isLowInformationLine(line))
     .filter((line) => !/^\d+:\s*".*"$/.test(line))
     .slice(-24)
     .join("\n");
@@ -317,11 +318,43 @@ function meaningfulTailLines(tail: string, count = 8) {
     .split("\n")
     .map(stripTerminalNoise)
     .map((line) => line.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "").trim())
+    .map((line) => line.replace(/^[›❯]\s*/, "").trim())
     .filter((line) => line.length > 0)
     .filter((line) => !/^[╭╮╰╯│─━═—\s]+$/.test(line))
     .filter((line) => !/^--/.test(line))
-    .filter((line) => !/^›\s/.test(line))
+    .filter((line) => !isLowInformationLine(line))
     .slice(-count);
+}
+
+function isLowInformationLine(line: string) {
+  const lower = line.toLowerCase().trim();
+  if (lower === "i") return true;
+  if (lower.includes("esc to interrupt")) return true;
+  if (lower.includes("tab to queue message")) return true;
+  if (lower.includes("context left") || lower.includes("context used")) return true;
+  if (/\b(working|thinking|running)\s*\([^)]*\)/i.test(lower)) return true;
+  if (/^latest checkpoint:\s*tab to queue message/i.test(lower)) return true;
+  if (/^working on [\w.-]+\.?$/i.test(lower)) return true;
+  return false;
+}
+
+function latestActionableLine(lines: string[]) {
+  const actionWords = [
+    "bug", "fix", "fixed", "issue", "problem", "error", "failed", "warning",
+    "implement", "implemented", "update", "updated", "change", "changed", "build",
+    "test", "check", "commit", "详情", "列表", "展示", "不合理", "问题", "bug",
+    "修", "改", "实现", "添加", "删除", "切换",
+  ];
+  return [...lines]
+    .reverse()
+    .find((line) => {
+      const lower = line.toLowerCase();
+      return actionWords.some((word) => lower.includes(word));
+    });
+}
+
+function shortDisplayLine(line: string, maxLength = 150) {
+  return line.length > maxLength ? `${line.slice(0, maxLength - 3)}...` : line;
 }
 
 function summarizeRecentWork(tail: string): string {
@@ -329,15 +362,17 @@ function summarizeRecentWork(tail: string): string {
     .filter((line, index, all) => index === 0 || line !== all[index - 1])
     .filter((line) => {
       const lower = line.toLowerCase();
-      return /succeeded|passed|finished|completed|done|fixed|updated|created|generated|built|compiled|checked|installed|launched|failed|error/.test(lower);
+      return /succeeded|passed|finished|completed|done|fixed|updated|created|generated|built|compiled|checked|installed|launched|failed|error|bug|issue|problem|warning|修|改|问题|不合理|详情|列表|展示|实现|添加|删除|切换/.test(lower);
     })
     .slice(-4)
-    .map((line) => line.length > 150 ? `${line.slice(0, 147)}...` : line);
+    .map(shortDisplayLine);
 
   if (lines.length === 0) {
-    const recent = meaningfulTailLines(tail, 4)
+    const recent = meaningfulTailLines(tail, 8)
       .filter((line, index, all) => index === 0 || line !== all[index - 1])
-      .map((line) => line.length > 150 ? `${line.slice(0, 147)}...` : line);
+      .filter((line) => line.length > 8)
+      .slice(-4)
+      .map(shortDisplayLine);
     if (recent.length === 0) {
       return "No recent work has been captured yet.";
     }
@@ -356,7 +391,7 @@ function phaseFeedbackMessage(
   fingerprint: string,
   source: InteractionMessage["source"],
 ): InteractionMessage {
-  const lastLine = lines.at(-1);
+  const lastLine = latestActionableLine(lines) ?? lines.at(-1);
   const base = {
     id: `${pane.id}:feedback:${status}:${fingerprint}`,
     paneId: pane.id,
@@ -461,12 +496,13 @@ function localInteractionMessages(
   }
 
   if (status === "running") {
+    const actionable = latestActionableLine(lines);
     return [historyMessage, {
       ...currentBase,
       kind: "progress",
       priority: "normal",
       title: "Working",
-      body: title ? `Working on ${title}.` : reason || "Working on the current task.",
+      body: actionable ? `Working through: ${shortDisplayLine(actionable)}` : reason || "Working on the current task.",
     }, phaseFeedbackMessage(pane, lines, status, reason, now, fingerprint, historyMessage.source)];
   }
 
