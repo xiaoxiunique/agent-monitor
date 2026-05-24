@@ -4,6 +4,7 @@ import SwiftTerm
 struct TerminalPaneView: View {
     let pane: Pane
     @Environment(MonitorStore.self) private var store
+    @Environment(\.scenePhase) private var scenePhase
     @State private var service = TerminalWebSocketService()
 
     var body: some View {
@@ -21,6 +22,16 @@ struct TerminalPaneView: View {
                     systemImage: "terminal",
                     description: Text("Configure service URL and token in Settings.")
                 )
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                service.reconnectIfPossible()
+            case .background:
+                service.suspendForBackground()
+            default:
+                break
             }
         }
     }

@@ -25,9 +25,18 @@ final class TerminalWebSocketService {
 
     private var wsTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
+    private var lastParameters: ConnectionParameters?
+    private var connectionKey: String?
 
-    func connect(with params: ConnectionParameters) {
-        disconnect()
+    func connect(with params: ConnectionParameters, force: Bool = false) {
+        let nextConnectionKey = connectionKey(for: params)
+        if !force, connectionKey == nextConnectionKey, wsTask != nil {
+            return
+        }
+
+        closeCurrentTask(notifyDisconnected: false, clearParameters: false)
+        lastParameters = params
+        connectionKey = nextConnectionKey
 
         state = .connecting
         onStateChange?(.connecting)
@@ -66,6 +75,18 @@ final class TerminalWebSocketService {
         }
     }
 
+    func reconnectIfPossible() {
+        guard let params = lastParameters else { return }
+        connect(with: params, force: true)
+    }
+
+    func suspendForBackground() {
+        closeCurrentTask(notifyDisconnected: false, clearParameters: false)
+        if state == .connected || state == .connecting {
+            state = .disconnected
+        }
+    }
+
     func sendInput(_ text: String) {
         guard let wsTask, state == .connected || state == .connecting else { return }
         let msg = "{\"type\":\"input\",\"data\":\(jsonEscape(text))}"
@@ -73,6 +94,7 @@ final class TerminalWebSocketService {
     }
 
     func sendResize(cols: Int, rows: Int) {
+        updateStoredTerminalSize(cols: cols, rows: rows)
         guard let wsTask, state == .connected || state == .connecting else { return }
         let msg = "{\"type\":\"resize\",\"cols\":\(cols),\"rows\":\(rows)}"
         wsTask.send(.string(msg)) { _ in }
@@ -87,16 +109,50 @@ final class TerminalWebSocketService {
     }
 
     func disconnect() {
+        closeCurrentTask(notifyDisconnected: true, clearParameters: true)
+    }
+
+    // MARK: - Private
+
+    private func closeCurrentTask(notifyDisconnected: Bool, clearParameters: Bool) {
         receiveTask?.cancel()
         receiveTask = nil
         let task = wsTask
         wsTask = nil
+        connectionKey = nil
+        if clearParameters {
+            lastParameters = nil
+        }
         let wasActive = state == .connected || state == .connecting
-        if wasActive { state = .disconnected }
+        if notifyDisconnected, wasActive {
+            state = .disconnected
+            onStateChange?(.disconnected)
+        }
         task?.cancel(with: .goingAway, reason: nil)
     }
 
-    // MARK: - Private
+    private func connectionKey(for params: ConnectionParameters) -> String {
+        [
+            params.baseURL.absoluteString,
+            params.token,
+            params.paneId,
+            String(params.cols),
+            String(params.rows),
+        ].joined(separator: "\n")
+    }
+
+    private func updateStoredTerminalSize(cols: Int, rows: Int) {
+        guard let params = lastParameters else { return }
+        let updatedParams = ConnectionParameters(
+            baseURL: params.baseURL,
+            token: params.token,
+            paneId: params.paneId,
+            cols: cols,
+            rows: rows
+        )
+        lastParameters = updatedParams
+        connectionKey = connectionKey(for: updatedParams)
+    }
 
     private func receiveLoop(_ task: URLSessionWebSocketTask) async {
         while !Task.isCancelled {
@@ -117,28 +173,38 @@ final class TerminalWebSocketService {
                 switch server.type {
                 case "data":
                     if let payload = server.data {
-                        state = .connected
+                        guard wsTask === task else { return }
+                        if state != .connected {
+                            state = .connected
+                            onStateChange?(.connected)
+                        }
                         onData?(payload)
                     }
                 case "exit":
-                    state = .closed(exitCode: server.exitCode)
-                    onStateChange?(state)
+                    markTaskClosed(task, state: .closed(exitCode: server.exitCode))
                     return
                 case "error":
-                    state = .error(server.error ?? "Unknown error")
-                    onStateChange?(state)
+                    markTaskClosed(task, state: .error(server.error ?? "Unknown error"))
                     return
                 default:
                     break
                 }
             } catch {
                 if !Task.isCancelled {
-                    state = .disconnected
-                    onStateChange?(.disconnected)
+                    markTaskClosed(task, state: .disconnected)
                 }
                 return
             }
         }
+    }
+
+    private func markTaskClosed(_ task: URLSessionWebSocketTask, state nextState: State) {
+        guard wsTask === task else { return }
+        receiveTask = nil
+        wsTask = nil
+        connectionKey = nil
+        state = nextState
+        onStateChange?(nextState)
     }
 
     private func jsonEscape(_ s: String) -> String {
