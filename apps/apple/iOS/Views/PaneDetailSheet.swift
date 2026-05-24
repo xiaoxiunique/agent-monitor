@@ -16,7 +16,6 @@ struct PaneDetailView: View {
     @State private var showKillConfirmation = false
     @State private var showTerminal = false
     @State private var showInfo = false
-    @State private var showLongContext = false
     @State private var actionPane: Pane
     @State private var logRefreshHint: PaneLogRefreshHint?
     @State private var userMessages: [UserInteractionMessage] = []
@@ -38,7 +37,6 @@ struct PaneDetailView: View {
             isLiveServer: isLiveServer,
             userMessages: userMessages,
             onOpenTerminal: { openTerminalIfLive() },
-            onOpenLongContext: { openLongContextIfLive() },
             onSendAction: { payload in
                 guard isLiveServer else { return false }
                 let response = await store.sendText(payload, to: actionPane, vimMode: false)
@@ -95,15 +93,6 @@ struct PaneDetailView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 4) {
-                    Button { openLongContextIfLive() } label: {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 16))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .disabled(!isLiveServer)
-                    .accessibilityLabel("Open longer context")
-
                     Button { openTerminalIfLive() } label: {
                         Image(systemName: "terminal")
                             .font(.system(size: 16))
@@ -142,18 +131,6 @@ struct PaneDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This closes this tmux pane. Other panes in the same project stay available.")
-        }
-        .sheet(isPresented: $showLongContext) {
-            NavigationStack {
-                LongContextView(pane: actionPane)
-                    .navigationTitle("Long Context")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button("Done") { showLongContext = false }
-                        }
-                    }
-            }
         }
         .sheet(isPresented: $showTerminal) {
             NavigationStack {
@@ -210,14 +187,6 @@ struct PaneDetailView: View {
             return
         }
         showTerminal = true
-    }
-
-    private func openLongContextIfLive() {
-        guard isLiveServer else {
-            Haptics.sent(success: false)
-            return
-        }
-        showLongContext = true
     }
 }
 
@@ -288,7 +257,6 @@ private struct AgentChatTimelineContainer: View {
     let isLiveServer: Bool
     let userMessages: [UserInteractionMessage]
     let onOpenTerminal: () -> Void
-    let onOpenLongContext: () -> Void
     let onSendAction: (String) async -> Bool
 
     @Environment(MonitorStore.self) private var store
@@ -310,15 +278,10 @@ private struct AgentChatTimelineContainer: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    AgentOverviewPanel(
+                    ConversationStatusLine(
                         session: currentPane.session,
                         status: currentPane.status,
-                        title: currentPane.title,
-                        reason: currentPane.reason,
-                        tail: currentPane.tail,
                         updatedAt: currentPane.updatedAt,
-                        interpretedMessages: currentPane.messages ?? [],
-                        latestUserMessage: userMessages.last?.text,
                         isLiveServer: isLiveServer
                     )
 
@@ -335,19 +298,12 @@ private struct AgentChatTimelineContainer: View {
                                 actions: message.actions,
                                 actionsEnabled: isLiveServer,
                                 onOpenTerminal: onOpenTerminal,
-                                onOpenLongContext: onOpenLongContext,
                                 onSendAction: onSendAction
                             )
                         case let .user(message):
                             UserMessageBubble(message: message)
                         }
                     }
-
-                    LastOutputCard(
-                        tail: currentPane.tail,
-                        isTerminalAvailable: isLiveServer,
-                        onOpenTerminal: onOpenTerminal
-                    )
 
                     Color.clear
                         .frame(height: 1)
@@ -399,16 +355,8 @@ private struct AgentChatTimelineContainer: View {
     }
 
     private var chatEvents: [AgentChatEvent] {
-        let interpretedMessages = currentPane.messages ?? []
-        let sourceMessages = interpretedMessages.isEmpty
-            ? fallbackInteractionMessages(for: currentPane)
-            : interpretedMessages
-        let visibleSourceMessages = visibleAgentMessages(from: sourceMessages)
-        let agentMessages = visibleSourceMessages.isEmpty
-            ? visibleAgentMessages(from: fallbackInteractionMessages(for: currentPane))
-            : visibleSourceMessages
-        let agentEvents = agentMessages
-            .map(AgentChatEvent.agent)
+        let agentMessages = conversationMessages(for: currentPane)
+        let agentEvents = agentMessages.map(AgentChatEvent.agent)
         let userEvents = userMessages.map(AgentChatEvent.user)
         return (agentEvents + userEvents).sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
@@ -417,16 +365,34 @@ private struct AgentChatTimelineContainer: View {
         }
     }
 
+    private func conversationMessages(for pane: Pane) -> [InteractionMessage] {
+        var messages = visibleAgentMessages(from: pane.messages ?? [])
+        if messages.isEmpty {
+            messages = visibleAgentMessages(from: fallbackInteractionMessages(for: pane))
+        }
+
+        if let checkpoint = checkpointMessage(for: pane),
+           !messages.contains(where: { isDuplicateConversationMessage($0, checkpoint) }) {
+            messages.append(checkpoint)
+        }
+
+        return messages
+            .filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return messageOrder(lhs.kind) < messageOrder(rhs.kind)
+            }
+    }
+
     private func visibleAgentMessages(from messages: [InteractionMessage]) -> [InteractionMessage] {
         messages.compactMap { message in
-            guard message.kind != .summary else { return nil }
             guard let body = LocalSummary.displayBody(
                 for: message,
                 status: currentPane.status,
                 title: cleanTaskTitle(currentPane.title),
                 reason: currentPane.reason,
                 tail: currentPane.tail,
-                latestUserMessage: userMessages.last?.text
+                latestUserMessage: message.kind == .summary ? nil : userMessages.last?.text
             ) else { return nil }
             return InteractionMessage(
                 id: message.id,
@@ -441,6 +407,78 @@ private struct AgentChatTimelineContainer: View {
                 createdAt: message.createdAt
             )
         }
+    }
+
+    private func checkpointMessage(for pane: Pane) -> InteractionMessage? {
+        let lines = LocalSummary.liveActivity(from: pane.tail)
+        guard let latest = lines.last, !latest.isEmpty else { return nil }
+
+        let body: String
+        let title: String
+        let kind: InteractionMessageKind
+        let priority: InteractionMessagePriority
+
+        switch pane.status {
+        case .running:
+            title = "Working"
+            body = "正在处理：\(latest)"
+            kind = .progress
+            priority = .normal
+        case .waiting:
+            title = "Needs your input"
+            body = latest
+            kind = .question
+            priority = .high
+        case .failed:
+            title = "Needs follow-up"
+            body = pane.reason.isEmpty ? latest : pane.reason
+            kind = .error
+            priority = .high
+        case .done:
+            title = "Done"
+            body = pane.reason.isEmpty ? "已完成：\(latest)" : pane.reason
+            kind = .done
+            priority = .normal
+        case .idle:
+            title = "Ready"
+            body = pane.reason.isEmpty ? "空闲中，可以发送下一条指令。" : pane.reason
+            kind = .status
+            priority = .low
+        }
+
+        return InteractionMessage(
+            id: "checkpoint-\(pane.id)-\(pane.status.rawValue)-\(tailHashInput(latest))-\(pane.updatedAt.timeIntervalSince1970)",
+            paneId: pane.id,
+            role: .agent,
+            kind: kind,
+            priority: priority,
+            title: title,
+            body: body,
+            actions: nil,
+            source: nil,
+            createdAt: pane.updatedAt
+        )
+    }
+
+    private func isDuplicateConversationMessage(_ lhs: InteractionMessage, _ rhs: InteractionMessage) -> Bool {
+        let left = lhs.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = rhs.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return left == right || left.contains(right) || right.contains(left)
+    }
+
+    private func messageOrder(_ kind: InteractionMessageKind) -> Int {
+        switch kind {
+        case .summary: 0
+        case .status, .progress: 1
+        case .notification: 2
+        case .question, .permissionRequest: 3
+        case .error: 4
+        case .done: 5
+        }
+    }
+
+    private func tailHashInput(_ value: String) -> String {
+        String(value.unicodeScalars.map { String($0.value, radix: 36) }.joined().prefix(24))
     }
 
     private func fallbackInteractionMessages(for pane: Pane) -> [InteractionMessage] {
@@ -1321,131 +1359,6 @@ private extension String {
     }
 }
 
-private struct LongContextView: View {
-    let pane: Pane
-
-    @Environment(MonitorStore.self) private var store
-    @Environment(\.colorScheme) private var colorScheme
-    @State private var selectedLineCount = 1200
-    @State private var contextText = ""
-    @State private var capturedAt: Date?
-    @State private var isLoading = false
-    @State private var errorMessage: String?
-    @State private var loadSequence = 0
-
-    private let lineCountOptions = [300, 1200, 3000]
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Picker("Lines", selection: $selectedLineCount) {
-                    ForEach(lineCountOptions, id: \.self) { count in
-                        Text("\(count)").tag(count)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                Button {
-                    Task { await loadContext() }
-                } label: {
-                    if isLoading {
-                        ProgressView()
-                            .controlSize(.small)
-                            .frame(width: 44, height: 44)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                            .frame(width: 44, height: 44)
-                    }
-                }
-                .buttonStyle(.bordered)
-                .disabled(isLoading)
-                .accessibilityLabel("Refresh context")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-
-            HStack(spacing: 8) {
-                Text("\(selectedLineCount) lines")
-                if let capturedAt {
-                    Text("·")
-                    Text(capturedAt, style: .relative)
-                }
-                Spacer()
-                Button {
-                    copyContext()
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                .font(.system(size: 12, weight: .semibold))
-                .disabled(contextText.isEmpty)
-            }
-            .font(.system(size: 12, design: .monospaced))
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 14)
-            .padding(.bottom, 8)
-
-            ZStack(alignment: .topLeading) {
-                TerminalLogTextView(
-                    text: contextText,
-                    deferUpdatesWhileAwayFromTail: false,
-                    followTailRequest: 0,
-                    isUserScrolling: .constant(false),
-                    isFollowingTail: .constant(true)
-                )
-
-                if isLoading && contextText.isEmpty {
-                    ProgressView("Loading context...")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                        .padding(14)
-                } else if let errorMessage {
-                    Text(errorMessage)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.red)
-                        .padding(14)
-                } else if contextText.isEmpty {
-                    Text("No context captured.")
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.46))
-                        .padding(14)
-                }
-            }
-            .background(Color.black)
-        }
-        .background(AgentMonitorTheme.backgroundGradient(for: colorScheme))
-        .task {
-            await loadContext()
-        }
-        .onChange(of: selectedLineCount) { _, _ in
-            Task { await loadContext() }
-        }
-    }
-
-    private func loadContext() async {
-        let sequence = loadSequence + 1
-        loadSequence = sequence
-        let requestedLineCount = selectedLineCount
-        isLoading = true
-        errorMessage = nil
-        do {
-            let response = try await store.loadPaneContext(pane, lines: requestedLineCount)
-            guard sequence == loadSequence else { return }
-            contextText = response.tail
-            capturedAt = response.capturedAt
-        } catch {
-            guard sequence == loadSequence else { return }
-            errorMessage = error.localizedDescription
-        }
-        guard sequence == loadSequence else { return }
-        isLoading = false
-    }
-
-    private func copyContext() {
-        UIPasteboard.general.string = contextText
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    }
-}
-
 private extension UITextView {
 	    var isNearBottom: Bool {
 	        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
@@ -1763,44 +1676,13 @@ private enum LogText {
     }
 }
 
-// MARK: - Agent Overview
+// MARK: - Conversation Header
 
-private struct AgentOverviewPanel: View {
+private struct ConversationStatusLine: View {
     let session: String
     let status: PaneStatus
-    let title: String
-    let reason: String
-    let tail: String
     let updatedAt: Date
-    let interpretedMessages: [InteractionMessage]
-    let latestUserMessage: String?
     let isLiveServer: Bool
-
-    init(
-        session: String,
-        status: PaneStatus,
-        title: String,
-        reason: String,
-        tail: String,
-        updatedAt: Date,
-        interpretedMessages: [InteractionMessage] = [],
-        latestUserMessage: String? = nil,
-        isLiveServer: Bool = true
-    ) {
-        self.session = session
-        self.status = status
-        self.title = title
-        self.reason = reason
-        self.tail = tail
-        self.updatedAt = updatedAt
-        self.interpretedMessages = interpretedMessages
-        self.latestUserMessage = latestUserMessage
-        self.isLiveServer = isLiveServer
-    }
-
-    private var cleanTitle: String {
-        cleanTaskTitle(title)
-    }
 
     private var agentLabel: String {
         if session.hasPrefix("cc_") { return "Claude Code" }
@@ -1811,276 +1693,52 @@ private struct AgentOverviewPanel: View {
     private var stateTitle: String {
         switch status {
         case .running: return "Working"
-        case .waiting: return "Needs your input"
-        case .idle: return "Idle"
-        case .failed: return "Something went wrong"
-        case .done: return "Completed"
+        case .waiting: return "Needs input"
+        case .idle: return "Ready"
+        case .failed: return "Needs follow-up"
+        case .done: return "Done"
         }
-    }
-
-    private var summaryText: String {
-        if let message = interpretedMessages.first(where: { $0.kind == .summary }),
-           let body = LocalSummary.displayBody(
-                for: message,
-                status: status,
-                title: cleanTitle,
-                reason: reason,
-                tail: tail,
-                latestUserMessage: latestUserMessage
-           ) {
-            return body
-        }
-        return LocalSummary.recentWork(from: tail, latestUserMessage: latestUserMessage)
-    }
-
-    private var currentStateText: String {
-        if let message = interpretedMessages.first(where: { $0.kind != .summary && $0.kind != .notification }),
-           let body = LocalSummary.displayBody(
-                for: message,
-                status: status,
-                title: cleanTitle,
-                reason: reason,
-                tail: tail,
-                latestUserMessage: latestUserMessage
-           ) {
-            return body
-        }
-        return LocalSummary.currentState(status: status, title: cleanTitle, reason: reason, tail: tail, latestUserMessage: latestUserMessage)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 14) {
-                AgentAvatar(session: session, size: 52)
+        HStack(spacing: 10) {
+            AgentAvatar(session: session, size: 28)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(agentLabel)
-                        .font(.system(size: 17, weight: .semibold))
-
-                    if !cleanTitle.isEmpty {
-                        Text(cleanTitle)
-                            .font(.system(size: 14))
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-
-                Spacer()
-
-                StatusPill(status: status, title: stateTitle)
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Recent work")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .textCase(.uppercase)
-
-                Text(summaryText)
-                    .font(.system(size: 15))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(agentLabel)
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-            HStack(alignment: .top, spacing: 12) {
-                statusIcon
-                    .frame(width: 30, height: 30)
-                    .padding(.top, 1)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text("Current state")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .textCase(.uppercase)
-
-                        Text(updatedAt, style: .relative)
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary)
-                    }
-
-                    Text(currentStateText)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundColor(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .padding(14)
-            .background(statusColor(status).opacity(0.08))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-            if !isLiveServer {
-                Label("Actions and live terminal are available after switching to this server.", systemImage: "lock.fill")
-                    .font(.system(size: 12, weight: .medium))
+                Text(updatedAt, style: .relative)
+                    .font(.system(size: 11))
                     .foregroundColor(.secondary)
-                    .padding(.top, -2)
             }
-        }
-        .padding(16)
-        .background(Color(.systemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
 
-    @ViewBuilder
-    private var statusIcon: some View {
-        switch status {
-        case .running:
-            ProgressView()
-                .controlSize(.regular)
-        case .waiting:
-            Image(systemName: "questionmark.circle.fill")
-                .font(.system(size: 28))
-                .foregroundColor(.yellow)
-        case .idle:
-            Image(systemName: "moon.fill")
-                .font(.system(size: 24))
-                .foregroundColor(.gray)
-        case .failed:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 26))
-                .foregroundColor(.red)
-        case .done:
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 28))
-                .foregroundColor(.blue)
+            Spacer()
+
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(statusColor(status))
+                    .frame(width: 7, height: 7)
+                Text(isLiveServer ? stateTitle : "Snapshot")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(isLiveServer ? statusColor(status) : .secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background((isLiveServer ? statusColor(status) : Color.secondary).opacity(0.10), in: Capsule())
         }
+        .padding(.horizontal, 2)
+        .padding(.bottom, 2)
     }
 }
 
-private struct StatusPill: View {
-    let status: PaneStatus
-    let title: String
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor(status))
-                .frame(width: 7, height: 7)
-            Text(title)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(statusColor(status))
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(statusColor(status).opacity(0.12))
-        .clipShape(Capsule())
-    }
-}
-
-// MARK: - Feedback Timeline
+// MARK: - Chat Messages
 
 private struct UserInteractionMessage: Identifiable, Equatable {
     let id = UUID()
     let text: String
     let sentAt: Date
-}
-
-private struct FeedbackTimeline: View {
-    let session: String
-    let status: PaneStatus
-    let title: String
-    let reason: String
-    let tail: String
-    let updatedAt: Date
-    let interpretedMessages: [InteractionMessage]
-    let userMessages: [UserInteractionMessage]
-
-    private var cleanTitle: String {
-        cleanTaskTitle(title)
-    }
-
-    private var feedbackMessages: [InteractionMessage] {
-        let messages = interpretedMessages.filter { $0.kind == .notification || $0.priority == .high }
-        if !messages.isEmpty {
-            return messages
-        }
-        return [
-            InteractionMessage(
-                id: "fallback-feedback-\(status.rawValue)",
-                paneId: "",
-                role: .agent,
-                kind: .notification,
-                priority: status == .waiting || status == .failed ? .high : .normal,
-                title: LocalSummary.feedbackTitle(status: status),
-                body: LocalSummary.feedback(status: status, title: cleanTitle, reason: reason, tail: tail),
-                actions: nil,
-                source: nil,
-                createdAt: updatedAt
-            )
-        ]
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Feedback")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(.secondary)
-                .textCase(.uppercase)
-
-            if status == .running || status == .waiting {
-                LiveActivityPanel(lines: LocalSummary.liveActivity(from: tail))
-            }
-
-            ForEach(feedbackMessages) { message in
-                AgentMessageBubble(
-                    session: session,
-                    status: status,
-                    kind: message.kind,
-                    title: message.title,
-                    message: message.body,
-                    updatedAt: message.createdAt,
-                    actions: message.actions,
-                    onOpenTerminal: {},
-                    onOpenLongContext: {},
-                    onSendAction: { _ in false }
-                )
-            }
-
-            ForEach(userMessages) { message in
-                UserMessageBubble(message: message)
-            }
-        }
-    }
-}
-
-private struct LiveActivityPanel: View {
-    let lines: [String]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Live activity")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .textCase(.uppercase)
-            }
-
-            if lines.isEmpty {
-                Text("Waiting for the next visible checkpoint...")
-                    .font(.system(size: 14))
-                    .foregroundColor(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(lines, id: \.self) { line in
-                        Text(line)
-                            .font(.system(size: 14))
-                            .foregroundColor(.primary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(Color(.systemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
 }
 
 private struct AgentMessageBubble: View {
@@ -2093,7 +1751,6 @@ private struct AgentMessageBubble: View {
     var actions: [InteractionAction]?
     var actionsEnabled = true
     var onOpenTerminal: () -> Void
-    var onOpenLongContext: () -> Void
     var onSendAction: (String) async -> Bool
 
     var body: some View {
@@ -2118,10 +1775,10 @@ private struct AgentMessageBubble: View {
                     .foregroundColor(.primary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let actions, !actions.isEmpty {
+                if !visibleActions.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
+                            ForEach(Array(visibleActions.enumerated()), id: \.offset) { _, action in
                                 Button {
                                     perform(action)
                                 } label: {
@@ -2154,6 +1811,10 @@ private struct AgentMessageBubble: View {
         kind == .summary ? .secondary : statusColor(status)
     }
 
+    private var visibleActions: [InteractionAction] {
+        (actions ?? []).filter { $0.payload != "open_long_context" }
+    }
+
     private func perform(_ action: InteractionAction) {
         guard actionsEnabled else {
             Haptics.sent(success: false)
@@ -2162,9 +1823,6 @@ private struct AgentMessageBubble: View {
         switch action.payload {
         case "open_terminal":
             onOpenTerminal()
-            Haptics.sent(success: true)
-        case "open_long_context":
-            onOpenLongContext()
             Haptics.sent(success: true)
         default:
             Task {
@@ -2428,109 +2086,6 @@ private func cleanTaskTitle(_ value: String) -> String {
         title = String(title.unicodeScalars.dropFirst())
     }
     return title.trimmingCharacters(in: .whitespaces)
-}
-
-// MARK: - Agent Prompt Card (Info Sheet)
-
-private struct AgentPromptCard: View {
-    let tail: String
-
-    private var promptText: String {
-        AgentPromptText.extract(from: tail).isEmpty ? "Waiting for input..." : AgentPromptText.extract(from: tail)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Agent is asking", systemImage: "bubble.left.fill")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.yellow.opacity(0.9))
-
-            Text(promptText)
-                .font(.system(size: 14))
-                .foregroundColor(.primary)
-                .lineLimit(5)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(Color.yellow.opacity(0.08))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.yellow.opacity(0.2), lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-}
-
-// MARK: - Last Output Card (collapsed)
-
-private struct LastOutputCard: View {
-    let tail: String
-    let isTerminalAvailable: Bool
-    let onOpenTerminal: () -> Void
-
-    private var lastLines: String {
-        let lines = tail
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { line in
-                !line.isEmpty &&
-                !line.allSatisfy { "─━═— ".contains($0) } &&
-                !line.hasPrefix("-- INSERT") &&
-                !line.hasPrefix("-- NORMAL") &&
-                !(line.first.map { (0x2800...0x28FF).contains($0.unicodeScalars.first?.value ?? 0) } ?? false)
-            }
-        return lines.suffix(3).joined(separator: "\n")
-    }
-
-    var body: some View {
-        if isTerminalAvailable {
-            Button {
-                onOpenTerminal()
-            } label: {
-                cardContent
-            }
-            .buttonStyle(.plain)
-        } else {
-            cardContent
-        }
-    }
-
-    private var cardContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("Recent Output", systemImage: "text.alignleft")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.secondary)
-
-                Spacer()
-
-                HStack(spacing: 4) {
-                    Text(isTerminalAvailable ? "Full Terminal" : "Snapshot")
-                        .font(.system(size: 12))
-                    if isTerminalAvailable {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 10))
-                    }
-                }
-                .foregroundColor(isTerminalAvailable ? .accentColor : .secondary)
-            }
-
-            if lastLines.isEmpty {
-                Text("No output yet")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.tertiary)
-            } else {
-                Text(lastLines)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(3)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .padding(14)
-        .background(Color(.systemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
 }
 
 // MARK: - Input Bar

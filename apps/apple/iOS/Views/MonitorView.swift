@@ -187,18 +187,6 @@ private struct ServerWorkSessionsView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                ConnectionStatusBanner(
-                    state: state.connectionState,
-                    errorMessage: state.errorMessage,
-                    serverName: profile.displayName,
-                    serverURL: profile.url,
-                    isLoading: state.isLoading,
-                    onOpenSettings: { showingSettings = true }
-                )
-                .padding(.horizontal, 14)
-                .padding(.top, 10)
-                .padding(.bottom, 8)
-
                 if panes.isEmpty && !state.isLoading {
                     VStack(spacing: 20) {
                         Spacer()
@@ -262,7 +250,16 @@ private struct ServerWorkSessionsView: View {
             PaneDetailRoute(route: route)
         }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                ConnectionStatusBadge(
+                    state: state.connectionState,
+                    errorMessage: state.errorMessage,
+                    serverName: profile.displayName,
+                    serverURL: profile.url,
+                    isLoading: state.isLoading,
+                    onOpenSettings: { showingSettings = true }
+                )
+
                 Button {
                     selectServer(profile)
                 } label: {
@@ -655,7 +652,7 @@ private struct PaneDetailRoute: View {
 
 // MARK: - Connection Status
 
-private struct ConnectionStatusBanner: View {
+private struct ConnectionStatusBadge: View {
     @Environment(\.colorScheme) private var colorScheme
     let state: String
     let errorMessage: String?
@@ -720,45 +717,41 @@ private struct ConnectionStatusBanner: View {
     }
 
     var body: some View {
-        HStack(spacing: 11) {
-            Image(systemName: iconName)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundColor(tint)
-                .frame(width: 24, height: 24)
-                .opacity(isCheckingState && isLoading ? 0.78 : 1)
+        Button(action: onOpenSettings) {
+            HStack(spacing: 5) {
+                Image(systemName: iconName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .symbolEffect(.pulse, options: .repeating, value: isCheckingState && isLoading)
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.primary)
+                Text(compactTitle)
+                    .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
-
-                Text(detail)
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
             }
-
-            Spacer(minLength: 8)
-
-            if trimmedURL.isEmpty || state == "unconfigured" {
-                Button("Settings", action: onOpenSettings)
-                    .font(.system(size: 13, weight: .semibold))
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
+            .foregroundColor(tint)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(AgentMonitorTheme.surface(for: colorScheme), in: Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(tint.opacity(isProblemState ? 0.35 : 0.18), lineWidth: 1)
+            )
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(AgentMonitorTheme.surface(for: colorScheme))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(tint.opacity(isProblemState ? 0.35 : 0.16), lineWidth: 1)
-        )
-        .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 12 : 8, x: 0, y: 3)
-        .accessibilityElement(children: .combine)
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title). \(detail)")
+    }
+
+    private var compactTitle: String {
+        if trimmedURL.isEmpty || state == "unconfigured" {
+            return "Setup"
+        }
+        switch state {
+        case "live", "reconnecting":
+            return "Live"
+        case "connecting":
+            return errorMessage == nil ? "Checking" : "Offline"
+        default:
+            return "Offline"
+        }
     }
 }
 
