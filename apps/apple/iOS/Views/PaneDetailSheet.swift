@@ -64,6 +64,7 @@ struct PaneDetailView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             InputBar(
                 pane: actionPane,
+                isEnabled: isLiveServer,
                 inputText: $inputText,
                 vimMode: $vimMode,
                 showKillConfirmation: $showKillConfirmation,
@@ -93,23 +94,32 @@ struct PaneDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 16) {
-                    Button { showLongContext = true } label: {
+                HStack(spacing: 4) {
+                    Button { openLongContextIfLive() } label: {
                         Image(systemName: "doc.text.magnifyingglass")
                             .font(.system(size: 16))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
                     .disabled(!isLiveServer)
                     .accessibilityLabel("Open longer context")
 
-                    Button { showTerminal = true } label: {
+                    Button { openTerminalIfLive() } label: {
                         Image(systemName: "terminal")
                             .font(.system(size: 16))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
                     .disabled(!isLiveServer)
+                    .accessibilityLabel("Open terminal")
+
                     Button { showInfo = true } label: {
                         Image(systemName: "info.circle")
                             .font(.system(size: 16))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
+                    .accessibilityLabel("Open pane info")
                 }
             }
         }
@@ -235,7 +245,7 @@ private struct PaneActionSync: View {
     }
 
     private func updateActionPaneIfNeeded(from pane: Pane) {
-        if actionPane.identityForActions != pane.identityForActions {
+        if actionPane != pane {
             actionPane = pane
         }
     }
@@ -283,7 +293,13 @@ private struct AgentChatTimelineContainer: View {
 
     @Environment(MonitorStore.self) private var store
     @Environment(\.colorScheme) private var colorScheme
-    @State private var followTailRequest = 0
+    @State private var isUserNearTail = true
+    @State private var scrollViewportHeight: CGFloat = 0
+    @State private var tailMinY: CGFloat = .infinity
+    @State private var lastAutoScrolledEventFingerprint = ""
+
+    private static let scrollCoordinateSpaceName = "agent-chat-scroll"
+    private static let tailAutoScrollThreshold: CGFloat = 140
 
     private var currentPane: Pane {
         guard isLiveServer else { return initialPane }
@@ -334,19 +350,48 @@ private struct AgentChatTimelineContainer: View {
 
                     Color.clear
                         .frame(height: 1)
+                        .background(
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: ChatTailPositionPreferenceKey.self,
+                                    value: geometry.frame(in: .named(Self.scrollCoordinateSpaceName)).minY
+                                )
+                            }
+                        )
                         .id("chat-tail")
                 }
                 .padding(.bottom, 12)
             }
+            .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+            .background(
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: ChatViewportHeightPreferenceKey.self,
+                        value: geometry.size.height
+                    )
+                }
+            )
             .background(Color.clear)
+            .onPreferenceChange(ChatViewportHeightPreferenceKey.self) { height in
+                scrollViewportHeight = height
+                updateNearTail(viewportHeight: height)
+            }
+            .onPreferenceChange(ChatTailPositionPreferenceKey.self) { minY in
+                tailMinY = minY
+                updateNearTail(tailMinY: minY)
+            }
             .onAppear {
                 scrollToTail(proxy, animated: false)
+                lastAutoScrolledEventFingerprint = eventFingerprint(for: chatEvents)
             }
-            .onChange(of: chatEvents) { _, _ in
+            .onChange(of: chatEvents) { _, events in
+                let fingerprint = eventFingerprint(for: events)
+                defer { lastAutoScrolledEventFingerprint = fingerprint }
+                guard shouldAutoScrollToTail(for: events, fingerprint: fingerprint) else { return }
                 scrollToTail(proxy, animated: true)
             }
             .onChange(of: currentPane.updatedAt) { _, _ in
-                followTailRequest += 1
+                guard isUserNearTail else { return }
                 scrollToTail(proxy, animated: true)
             }
         }
@@ -417,6 +462,43 @@ private struct AgentChatTimelineContainer: View {
             }
         }
     }
+
+    private func shouldAutoScrollToTail(for events: [AgentChatEvent], fingerprint: String) -> Bool {
+        guard fingerprint != lastAutoScrolledEventFingerprint else { return false }
+        guard let newestEvent = events.max(by: { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+            if lhs.sortRank != rhs.sortRank { return lhs.sortRank < rhs.sortRank }
+            return lhs.id < rhs.id
+        }) else { return false }
+        return newestEvent.isUserMessage || isUserNearTail
+    }
+
+    private func updateNearTail(tailMinY nextTailMinY: CGFloat? = nil, viewportHeight nextViewportHeight: CGFloat? = nil) {
+        let effectiveTailMinY = nextTailMinY ?? tailMinY
+        let effectiveViewportHeight = nextViewportHeight ?? scrollViewportHeight
+        guard effectiveViewportHeight > 0 else { return }
+        isUserNearTail = effectiveTailMinY <= effectiveViewportHeight + Self.tailAutoScrollThreshold
+    }
+
+    private func eventFingerprint(for events: [AgentChatEvent]) -> String {
+        events.map(\.fingerprint).joined(separator: "\u{1f}")
+    }
+}
+
+private struct ChatTailPositionPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = .infinity
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ChatViewportHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
 }
 
 private enum AgentChatEvent: Identifiable, Equatable {
@@ -441,6 +523,31 @@ private enum AgentChatEvent: Identifiable, Equatable {
         switch self {
         case .agent: 0
         case .user: 1
+        }
+    }
+
+    var isUserMessage: Bool {
+        if case .user = self { return true }
+        return false
+    }
+
+    var fingerprint: String {
+        switch self {
+        case let .agent(message):
+            [
+                id,
+                message.kind.rawValue,
+                message.priority.rawValue,
+                message.title,
+                message.body,
+                message.createdAt.timeIntervalSince1970.description
+            ].joined(separator: "\u{1e}")
+        case let .user(message):
+            [
+                id,
+                message.text,
+                message.sentAt.timeIntervalSince1970.description
+            ].joined(separator: "\u{1e}")
         }
     }
 }
@@ -1204,6 +1311,7 @@ private struct LongContextView: View {
     @State private var capturedAt: Date?
     @State private var isLoading = false
     @State private var errorMessage: String?
+    @State private var loadSequence = 0
 
     private let lineCountOptions = [300, 1200, 3000]
 
@@ -1223,10 +1331,10 @@ private struct LongContextView: View {
                     if isLoading {
                         ProgressView()
                             .controlSize(.small)
-                            .frame(width: 32, height: 32)
+                            .frame(width: 44, height: 44)
                     } else {
                         Image(systemName: "arrow.clockwise")
-                            .frame(width: 32, height: 32)
+                            .frame(width: 44, height: 44)
                     }
                 }
                 .buttonStyle(.bordered)
@@ -1294,16 +1402,21 @@ private struct LongContextView: View {
     }
 
     private func loadContext() async {
-        guard !isLoading else { return }
+        let sequence = loadSequence + 1
+        loadSequence = sequence
+        let requestedLineCount = selectedLineCount
         isLoading = true
         errorMessage = nil
         do {
-            let response = try await store.loadPaneContext(pane, lines: selectedLineCount)
+            let response = try await store.loadPaneContext(pane, lines: requestedLineCount)
+            guard sequence == loadSequence else { return }
             contextText = response.tail
             capturedAt = response.capturedAt
         } catch {
+            guard sequence == loadSequence else { return }
             errorMessage = error.localizedDescription
         }
+        guard sequence == loadSequence else { return }
         isLoading = false
     }
 
@@ -1971,7 +2084,7 @@ private struct AgentMessageBubble: View {
                 if let actions, !actions.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            ForEach(actions, id: \.payload) { action in
+                            ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
                                 Button {
                                     perform(action)
                                 } label: {
@@ -1980,6 +2093,7 @@ private struct AgentMessageBubble: View {
                                         .foregroundColor(action.style == .destructive ? .red : .accentColor)
                                         .padding(.horizontal, 10)
                                         .padding(.vertical, 6)
+                                        .frame(minHeight: 36)
                                         .background(Color(.tertiarySystemFill), in: Capsule())
                                 }
                                 .buttonStyle(.plain)
@@ -2243,48 +2357,53 @@ private struct LastOutputCard: View {
     }
 
     var body: some View {
-        Button {
-            guard isTerminalAvailable else {
-                Haptics.sent(success: false)
-                return
+        if isTerminalAvailable {
+            Button {
+                onOpenTerminal()
+            } label: {
+                cardContent
             }
-            onOpenTerminal()
-        } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Label("Recent Output", systemImage: "text.alignleft")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.secondary)
+            .buttonStyle(.plain)
+        } else {
+            cardContent
+        }
+    }
 
-                    Spacer()
+    private var cardContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Recent Output", systemImage: "text.alignleft")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.secondary)
 
-                    HStack(spacing: 4) {
-                        Text(isTerminalAvailable ? "Full Terminal" : "Switch server")
-                            .font(.system(size: 12))
+                Spacer()
+
+                HStack(spacing: 4) {
+                    Text(isTerminalAvailable ? "Full Terminal" : "Snapshot")
+                        .font(.system(size: 12))
+                    if isTerminalAvailable {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 10))
                     }
-                    .foregroundColor(isTerminalAvailable ? .accentColor : .secondary)
                 }
-
-                if lastLines.isEmpty {
-                    Text("No output yet")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.tertiary)
-                } else {
-                    Text(lastLines)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .lineLimit(3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                .foregroundColor(isTerminalAvailable ? .accentColor : .secondary)
             }
-            .padding(14)
-            .background(Color(.systemBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            if lastLines.isEmpty {
+                Text("No output yet")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.tertiary)
+            } else {
+                Text(lastLines)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .buttonStyle(.plain)
-        .disabled(!isTerminalAvailable)
+        .padding(14)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
@@ -2292,6 +2411,7 @@ private struct LastOutputCard: View {
 
 private struct InputBar: View {
     let pane: Pane
+    let isEnabled: Bool
     @Environment(AppSettings.self) private var settings
     @Environment(BackgroundAudioKeepAlive.self) private var backgroundAudio
     @Binding var inputText: String
@@ -2337,11 +2457,12 @@ private struct InputBar: View {
     }
 
     private var isShowingVoiceHoldPanel: Bool {
-        inputMode == .voice && (isVoicePressing || voiceDisplayState.isActive || isFinalizingVoice)
+        isEnabled && inputMode == .voice && (isVoicePressing || voiceDisplayState.isActive || isFinalizingVoice)
     }
 
     private var isShowingFloatingTextDraft: Bool {
-        inputMode == .voice &&
+        isEnabled &&
+            inputMode == .voice &&
             !isShowingVoiceHoldPanel &&
             !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -2369,7 +2490,7 @@ private struct InputBar: View {
     }
 
     private var canSendText: Bool {
-        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isInputBusy
+        isEnabled && !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isInputBusy
     }
 
     private var isTextSendBusy: Bool {
@@ -2377,7 +2498,7 @@ private struct InputBar: View {
     }
 
     private var isInputBusy: Bool {
-        isTextSendBusy || isUploadingImage
+        !isEnabled || isTextSendBusy || isUploadingImage
     }
 
     private var isShowingBottomInteractionPanel: Bool {
@@ -2410,9 +2531,21 @@ private struct InputBar: View {
             voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: false)
         }
         .onAppear {
+            guard isEnabled else { return }
             Haptics.prepareVoicePress()
             voiceDisplayState.attach(to: voiceInput)
             prepareVoiceInputIfIdle(force: true)
+        }
+        .onChange(of: isEnabled) { _, enabled in
+            if enabled {
+                Haptics.prepareVoicePress()
+                voiceDisplayState.attach(to: voiceInput)
+                prepareVoiceInputIfIdle(force: true)
+            } else {
+                resetVoiceInteractionState(hideOverlay: true, keepTencentWarm: false)
+                voiceDisplayState.detach(from: voiceInput)
+                inputMode = .voice
+            }
         }
         .onChange(of: voiceDisplayState.phase) { _, _ in
             syncVoiceOverlayRuntimeFromState()
@@ -2442,7 +2575,13 @@ private struct InputBar: View {
 
             composerSurface
 
-            if let message = voiceStatusMessage, !isShowingVoiceHoldPanel {
+            if !isEnabled {
+                Label("Snapshot only. Switch to this machine before sending commands.", systemImage: "lock.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+            } else if let message = voiceStatusMessage, !isShowingVoiceHoldPanel {
                 Label(message, systemImage: voiceDisplayState.errorMessage == nil ? "waveform" : "exclamationmark.triangle.fill")
                     .font(.system(size: 12))
                     .foregroundColor(voiceDisplayState.errorMessage == nil ? .secondary : .red)
@@ -2508,6 +2647,7 @@ private struct InputBar: View {
                             .foregroundColor(vimMode ? .white : .secondary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
+                            .frame(minHeight: 36)
                             .background(vimMode ? Color.accentColor : AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
                     }
                     .buttonStyle(.plain)
@@ -2522,6 +2662,7 @@ private struct InputBar: View {
                     .foregroundColor(.primary.opacity(0.82))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
+                    .frame(minHeight: 36)
                     .background(AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
                     .buttonStyle(.plain)
                     .disabled(isInputBusy)
@@ -2535,6 +2676,7 @@ private struct InputBar: View {
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
+                    .frame(minHeight: 36)
                     .background(AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
                     .buttonStyle(.plain)
                     .disabled(isInputBusy)
@@ -2547,6 +2689,7 @@ private struct InputBar: View {
                         .font(.system(size: 12, weight: .semibold))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        .frame(minHeight: 36)
                 }
                 .buttonStyle(.plain)
                 .disabled(isInputBusy)
@@ -2564,6 +2707,7 @@ private struct InputBar: View {
                 .foregroundColor(isGoalModeEnabled ? .white : .secondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
+                .frame(minHeight: 36)
                 .background(
                     isGoalModeEnabled
                         ? Color.accentColor
@@ -2590,22 +2734,29 @@ private struct InputBar: View {
         HStack(spacing: 6) {
             imagePickerButton(isUploading: isUploadingImage, isDisabled: isInputBusy || voiceDisplayState.isActive)
 
-            HoldToSpeakButton(
-                isActive: isVoiceInteractionActive,
-                isStarting: voiceDisplayState.isStarting || isVoicePressing,
-                isListening: voiceDisplayState.isListening,
-                isPressing: isVoicePressing,
-                isCanceling: isCancelingVoice,
-                isFinalizing: isFinalizingVoice,
-                onPressStart: { touchStartedAt in
-                    beginVoiceInput(touchStartedAt: touchStartedAt)
-                },
-                onPressEnd: endVoiceInput,
-                onCancelStateChange: updateVoiceCancelVisualState,
-                onEnterCancelZone: triggerCancelZoneHaptic,
-                onPressCancel: cancelVoiceInput
-            )
-            .disabled(isInputBusy)
+            if isEnabled {
+                HoldToSpeakButton(
+                    isActive: isVoiceInteractionActive,
+                    isStarting: voiceDisplayState.isStarting || isVoicePressing,
+                    isListening: voiceDisplayState.isListening,
+                    isPressing: isVoicePressing,
+                    isCanceling: isCancelingVoice,
+                    isFinalizing: isFinalizingVoice,
+                    onPressStart: { touchStartedAt in
+                        beginVoiceInput(touchStartedAt: touchStartedAt)
+                    },
+                    onPressEnd: endVoiceInput,
+                    onCancelStateChange: updateVoiceCancelVisualState,
+                    onEnterCancelZone: triggerCancelZoneHaptic,
+                    onPressCancel: cancelVoiceInput
+                )
+                .disabled(isInputBusy)
+            } else {
+                Label("Read only", systemImage: "lock.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity)
+            }
 
             Button {
                 toggleInputMode()
@@ -2626,6 +2777,7 @@ private struct InputBar: View {
         .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 14 : 10, x: 0, y: 4)
         .padding(.horizontal, 18)
         .onAppear {
+            guard isEnabled else { return }
             scheduleVoiceInputPrepare(force: true, after: .zero)
         }
     }
@@ -2644,7 +2796,8 @@ private struct InputBar: View {
             AutoScrollingComposerTextView(
                 text: $inputText,
                 measuredHeight: $composerTextHeight,
-                maxLines: composerMaxLines
+                maxLines: composerMaxLines,
+                isEditable: isEnabled
             )
             .frame(height: composerTextHeight)
             .padding(.horizontal, 2)
@@ -2693,6 +2846,7 @@ private struct InputBar: View {
     }
 
     private func sendCurrentText() {
+        guard isEnabled else { return }
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard !isInputBusy else { return }
@@ -2748,7 +2902,7 @@ private struct InputBar: View {
 
     private func sendPresetText(_ text: String) async {
         let shouldSend = await MainActor.run {
-            guard !isInputBusy else { return false }
+            guard isEnabled, !isInputBusy else { return false }
             isSendingText = true
             return true
         }
@@ -2764,7 +2918,7 @@ private struct InputBar: View {
     }
 
     private func sendSelectedImage(_ item: PhotosPickerItem) async {
-        guard !isInputBusy else { return }
+        guard isEnabled, !isInputBusy else { return }
         isUploadingImage = true
         setImageFeedback(.progress("正在读取图片..."))
         defer { isUploadingImage = false }
@@ -2819,6 +2973,7 @@ private struct InputBar: View {
     }
 
     private func toggleInputMode() {
+        guard isEnabled else { return }
         if inputMode == .text {
             resetVoiceInteractionState(hideOverlay: true)
             inputMode = .voice
@@ -2831,6 +2986,7 @@ private struct InputBar: View {
     }
 
     private func toggleGoalMode() {
+        guard isEnabled else { return }
         isGoalModeEnabled.toggle()
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
 
@@ -2869,6 +3025,7 @@ private struct InputBar: View {
 
     @discardableResult
     private func beginVoiceInput(touchStartedAt: CFTimeInterval = CACurrentMediaTime()) -> Bool {
+        guard isEnabled else { return false }
         guard !voiceRuntime.isPressing else { return false }
         guard !voiceDisplayState.isActive else { return false }
 
@@ -3039,6 +3196,7 @@ private struct InputBar: View {
     }
 
     private func prepareVoiceInputIfIdle(force: Bool = false) {
+        guard isEnabled else { return }
         guard !voiceRuntime.isPressing, !voiceDisplayState.isActive, inputMode == .voice else { return }
         voiceInput.prepare(settings: settings, force: force)
     }
@@ -3193,6 +3351,7 @@ private struct AutoScrollingComposerTextView: View {
     @Binding var text: String
     @Binding var measuredHeight: CGFloat
     let maxLines: Int
+    let isEditable: Bool
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -3200,11 +3359,12 @@ private struct AutoScrollingComposerTextView: View {
                 text: $text,
                 measuredHeight: $measuredHeight,
                 minLines: 1,
-                maxLines: maxLines
+                maxLines: maxLines,
+                isEditable: isEditable
             )
 
             if text.isEmpty {
-                Text("Send to agent...")
+                Text(isEditable ? "Send to agent..." : "Read only")
                     .font(.system(size: 16))
                     .foregroundColor(Color(.placeholderText))
                     .padding(.top, 1)
@@ -4560,6 +4720,7 @@ private struct AutoScrollingTextView: UIViewRepresentable {
     @Binding var measuredHeight: CGFloat
     let minLines: Int
     let maxLines: Int
+    var isEditable = true
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -4581,12 +4742,16 @@ private struct AutoScrollingTextView: UIViewRepresentable {
         textView.showsVerticalScrollIndicator = false
         textView.keyboardDismissMode = .interactive
         textView.returnKeyType = .default
+        textView.isEditable = isEditable
+        textView.isSelectable = isEditable
         textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return textView
     }
 
     func updateUIView(_ textView: UITextView, context: Context) {
         context.coordinator.parent = self
+        textView.isEditable = isEditable
+        textView.isSelectable = isEditable
 
         if textView.text != text {
             textView.text = text

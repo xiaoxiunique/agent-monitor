@@ -309,15 +309,15 @@ private struct ServerWorkSessionsView: View {
     }
 
     private func openWorkSession(_ pane: Pane) {
-        let route = PaneNavigationRoute(
-            pane: pane,
-            serverIdentity: profile.monitorIdentity,
-            serverName: profile.displayName
-        )
         if !isActiveServer {
             settings.selectServer(profile.id)
             store.start()
         }
+        let route = PaneNavigationRoute(
+            pane: pane,
+            serverIdentity: settings.activeServerIdentity,
+            serverName: profile.displayName
+        )
         selectedPaneRoute = route
         Haptics.sent(success: true)
     }
