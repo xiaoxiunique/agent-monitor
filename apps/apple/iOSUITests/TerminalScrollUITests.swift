@@ -10,6 +10,9 @@ final class TerminalScrollUITests: XCTestCase {
     func testTerminalTouchCaptureReceivesVerticalDrag() {
         let app = XCUIApplication()
         app.launchArguments.append("AGENT_MONITOR_TERMINAL_SCROLL_UITEST")
+        if app.responds(to: Selector(("setShouldWaitForQuiescence:"))) {
+            app.setValue(false, forKey: "shouldWaitForQuiescence")
+        }
         app.launch()
 
         let capture = app.otherElements["terminal-touch-capture"]

@@ -82,16 +82,24 @@ struct SwiftTermView: UIViewRepresentable {
             }
         }
 
-        // Defer connection so the view has laid out and SwiftTerm knows its size
-        DispatchQueue.main.async {
-            let terminal = tv.getTerminal()
-            service.connect(with: .init(
-                baseURL: baseURL,
-                token: token,
-                paneId: pane.id,
-                cols: terminal.cols,
-                rows: terminal.rows
-            ))
+        #if DEBUG
+        let skipConnectionForScrollUITest = ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_SCROLL_UITEST")
+        #else
+        let skipConnectionForScrollUITest = false
+        #endif
+
+        if !skipConnectionForScrollUITest {
+            // Defer connection so the view has laid out and SwiftTerm knows its size.
+            DispatchQueue.main.async {
+                let terminal = tv.getTerminal()
+                service.connect(with: .init(
+                    baseURL: baseURL,
+                    token: token,
+                    paneId: pane.id,
+                    cols: terminal.cols,
+                    rows: terminal.rows
+                ))
+            }
         }
 
         return container
