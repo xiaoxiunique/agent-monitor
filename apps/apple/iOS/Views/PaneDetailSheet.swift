@@ -2793,11 +2793,16 @@ private struct InputBar: View {
     }
 
     private var textComposerSurface: some View {
-        HStack(alignment: .bottom, spacing: 10) {
+        HStack(alignment: .bottom, spacing: 6) {
             Button {
                 toggleInputMode()
             } label: {
-                ComposerIconLabel(systemImage: "waveform.circle", isLoading: false)
+                ComposerIconLabel(
+                    systemImage: "waveform",
+                    isLoading: false,
+                    variant: .softCircle,
+                    isActive: !isInputBusy
+                )
             }
             .buttonStyle(.plain)
             .disabled(isInputBusy)
@@ -2817,20 +2822,33 @@ private struct InputBar: View {
                 Button {
                     isShowingDraftEditor = true
                 } label: {
-                    ComposerIconLabel(systemImage: "arrow.up.left.and.arrow.down.right", isLoading: false)
+                    ComposerIconLabel(
+                        systemImage: "arrow.up.left.and.arrow.down.right",
+                        isLoading: false,
+                        variant: .softCircle,
+                        isActive: !isInputBusy
+                    )
                 }
                 .buttonStyle(.plain)
                 .disabled(isInputBusy)
                 .accessibilityLabel("Review full draft")
             }
 
-            imagePickerButton(isUploading: isUploadingImage, isDisabled: isInputBusy || voiceDisplayState.isActive)
+            imagePickerButton(
+                isUploading: isUploadingImage,
+                isDisabled: isInputBusy || voiceDisplayState.isActive,
+                variant: .softCircle
+            )
 
             Button {
                 sendCurrentText()
             } label: {
-                ComposerIconLabel(systemImage: "arrow.up.circle.fill", isLoading: isTextSendBusy)
-                    .foregroundColor(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .gray.opacity(0.38) : .accentColor)
+                ComposerIconLabel(
+                    systemImage: "arrow.up",
+                    isLoading: isTextSendBusy,
+                    variant: .filledCircle,
+                    isActive: canSendText || isTextSendBusy
+                )
             }
             .buttonStyle(.plain)
             .disabled(!canSendText)
@@ -2847,9 +2865,18 @@ private struct InputBar: View {
         .padding(.horizontal, 18)
     }
 
-    private func imagePickerButton(isUploading: Bool, isDisabled: Bool) -> some View {
+    private func imagePickerButton(
+        isUploading: Bool,
+        isDisabled: Bool,
+        variant: ComposerIconLabel.Variant = .plain
+    ) -> some View {
         PhotosPicker(selection: $selectedImageItem, matching: .images, photoLibrary: .shared()) {
-            ComposerIconLabel(systemImage: "camera", isLoading: isUploading)
+            ComposerIconLabel(
+                systemImage: "camera",
+                isLoading: isUploading,
+                variant: variant,
+                isActive: !isDisabled || isUploading
+            )
         }
         .disabled(isDisabled)
         .accessibilityLabel("Choose image")
@@ -3771,30 +3798,100 @@ private final class VoiceDisplayState {
 }
 
 private struct ComposerIconLabel: View {
+    enum Variant {
+        case plain
+        case softCircle
+        case filledCircle
+    }
+
     let systemImage: String
     let isLoading: Bool
+    var variant: Variant = .plain
+    var isActive = true
+
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ZStack {
-            if isLoading {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Image(systemName: systemImage)
-                    .font(.system(size: iconSize, weight: .medium))
-                    .foregroundColor(.primary.opacity(0.7))
+            iconBackground
+
+            Group {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(iconForegroundColor)
+                } else {
+                    Image(systemName: systemImage)
+                        .font(.system(size: iconSize, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                }
             }
+            .foregroundColor(iconForegroundColor)
+            .frame(width: innerSize, height: innerSize)
         }
-        .frame(width: 38, height: 44)
+        .frame(width: 44, height: 44)
         .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var iconBackground: some View {
+        switch variant {
+        case .plain:
+            Color.clear
+        case .softCircle:
+            Circle()
+                .fill(softCircleFill)
+                .overlay(
+                    Circle()
+                        .stroke(AgentMonitorTheme.separator(for: colorScheme).opacity(0.82), lineWidth: 1)
+                )
+                .frame(width: innerSize, height: innerSize)
+        case .filledCircle:
+            Circle()
+                .fill(isActive ? Color.accentColor : AgentMonitorTheme.softFill(for: colorScheme))
+                .frame(width: innerSize, height: innerSize)
+        }
+    }
+
+    private var innerSize: CGFloat {
+        switch variant {
+        case .plain:
+            38
+        case .softCircle, .filledCircle:
+            36
+        }
+    }
+
+    private var iconForegroundColor: Color {
+        switch variant {
+        case .plain:
+            .primary.opacity(0.7)
+        case .softCircle:
+            .primary.opacity(isActive ? 0.76 : 0.34)
+        case .filledCircle:
+            isActive ? .white : .secondary.opacity(0.46)
+        }
+    }
+
+    private var softCircleFill: Color {
+        if colorScheme == .dark {
+            return Color.white.opacity(isActive ? 0.08 : 0.045)
+        }
+        return Color.black.opacity(isActive ? 0.055 : 0.032)
     }
 
     private var iconSize: CGFloat {
         switch systemImage {
         case "keyboard":
             20
-        case "arrow.up.circle.fill":
-            24
+        case "arrow.up":
+            18
+        case "camera":
+            18
+        case "waveform":
+            19
+        case "arrow.up.left.and.arrow.down.right":
+            16
         default:
             21
         }
