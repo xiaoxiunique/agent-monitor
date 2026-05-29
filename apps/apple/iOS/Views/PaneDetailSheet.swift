@@ -14,6 +14,8 @@ struct PaneDetailView: View {
     @State private var showKillConfirmation = false
     @State private var showInfo = false
     @State private var actionPane: Pane
+    @State private var inputText = ""
+    @State private var vimMode = false
 
     init(pane: Pane, isLiveServer: Bool = true, serverName: String = "Server") {
         self.pane = pane
@@ -36,6 +38,33 @@ struct PaneDetailView: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 8)
             }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            InputBar(
+                pane: actionPane,
+                isEnabled: isLiveServer,
+                inputText: $inputText,
+                vimMode: $vimMode,
+                showKillConfirmation: $showKillConfirmation,
+                onSendText: { text in
+                    guard isLiveServer else { return false }
+                    let response = await store.sendText(text, to: actionPane, vimMode: vimMode)
+                    return response?.ok == true
+                },
+                onUserMessageSent: { _ in },
+                onRefineText: { text in
+                    await store.refineText(text)
+                },
+                onSendKey: { key in
+                    guard isLiveServer else { return false }
+                    let response = await store.sendKey(key, to: actionPane)
+                    return response?.ok == true
+                },
+                onUploadImage: { imageData in
+                    guard isLiveServer else { throw CancellationError() }
+                    return try await store.uploadImage(imageData, to: actionPane)
+                }
+            )
         }
         .navigationTitle(projectName)
         .navigationBarTitleDisplayMode(.inline)
