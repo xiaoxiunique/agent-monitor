@@ -53,7 +53,7 @@ struct SwiftTermView: UIViewRepresentable {
         tv.nativeBackgroundColor = UIColor(red: 0.02, green: 0.024, blue: 0.02, alpha: 1)
         tv.nativeForegroundColor = UIColor(red: 0.86, green: 0.90, blue: 0.82, alpha: 1)
         tv.caretColor = UIColor(red: 0.616, green: 0.878, blue: 0.482, alpha: 1)
-        tv.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        tv.font = UIFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         tv.isScrollEnabled = false
         tv.alwaysBounceVertical = false
         tv.keyboardDismissMode = .interactive
