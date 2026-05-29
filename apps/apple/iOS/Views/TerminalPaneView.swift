@@ -49,12 +49,13 @@ struct SwiftTermView: UIViewRepresentable {
 
     @MainActor
     func makeUIView(context: Context) -> TerminalView {
-        let tv = TerminalView(frame: .zero)
+        let tv = AgentMonitorTerminalView(frame: .zero)
         tv.nativeBackgroundColor = UIColor(red: 0.02, green: 0.024, blue: 0.02, alpha: 1)
         tv.nativeForegroundColor = UIColor(red: 0.86, green: 0.90, blue: 0.82, alpha: 1)
         tv.caretColor = UIColor(red: 0.616, green: 0.878, blue: 0.482, alpha: 1)
         tv.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        tv.alwaysBounceVertical = true
+        tv.isScrollEnabled = false
+        tv.alwaysBounceVertical = false
         tv.keyboardDismissMode = .interactive
         tv.allowMouseReporting = true
 
@@ -118,9 +119,15 @@ struct SwiftTermView: UIViewRepresentable {
             gesture.cancelsTouchesInView = true
             gesture.delaysTouchesBegan = false
             gesture.delaysTouchesEnded = false
+            gesture.maximumNumberOfTouches = 1
             gesture.delegate = self
+            if let terminalView = terminalView as? AgentMonitorTerminalView {
+                terminalView.remoteScrollGesture = gesture
+            }
             terminalView.addGestureRecognizer(gesture)
+            terminalView.panGestureRecognizer.isEnabled = false
             terminalView.panGestureRecognizer.require(toFail: gesture)
+            (terminalView as? AgentMonitorTerminalView)?.disableNativePanGestures()
             scrollGesture = gesture
         }
 
@@ -196,9 +203,46 @@ struct SwiftTermView: UIViewRepresentable {
         private static func isCursorKeyInput(_ value: String) -> Bool {
             value == "\u{001B}[A" ||
                 value == "\u{001B}[B" ||
+                value == "\u{001B}[C" ||
+                value == "\u{001B}[D" ||
                 value == "\u{001B}OA" ||
-                value == "\u{001B}OB"
+                value == "\u{001B}OB" ||
+                value == "\u{001B}OC" ||
+                value == "\u{001B}OD"
         }
+    }
+}
+
+private final class AgentMonitorTerminalView: TerminalView {
+    weak var remoteScrollGesture: UIPanGestureRecognizer?
+
+    override func addGestureRecognizer(_ gestureRecognizer: UIGestureRecognizer) {
+        super.addGestureRecognizer(gestureRecognizer)
+        disableNativePanGestureIfNeeded(gestureRecognizer)
+    }
+
+    override func mouseModeChanged(source: Terminal) {
+        disableNativePanGestures()
+    }
+
+    override func selectionChanged(source: Terminal) {
+        super.selectionChanged(source: source)
+        DispatchQueue.main.async { [weak self] in
+            self?.disableNativePanGestures()
+        }
+    }
+
+    func disableNativePanGestures() {
+        panGestureRecognizer.isEnabled = false
+        for gesture in gestureRecognizers ?? [] {
+            disableNativePanGestureIfNeeded(gesture)
+        }
+    }
+
+    private func disableNativePanGestureIfNeeded(_ gesture: UIGestureRecognizer) {
+        guard let pan = gesture as? UIPanGestureRecognizer else { return }
+        guard pan !== remoteScrollGesture else { return }
+        pan.isEnabled = false
     }
 }
 
@@ -210,7 +254,10 @@ extension SwiftTermView.Coordinator: UIGestureRecognizerDelegate {
             return true
         }
         let velocity = pan.velocity(in: terminalView)
-        return abs(velocity.y) > abs(velocity.x)
+        if abs(velocity.x) < 1 && abs(velocity.y) < 1 {
+            return true
+        }
+        return abs(velocity.y) >= abs(velocity.x)
     }
 
     func gestureRecognizer(
