@@ -48,7 +48,8 @@ struct SwiftTermView: UIViewRepresentable {
     }
 
     @MainActor
-    func makeUIView(context: Context) -> TerminalView {
+    func makeUIView(context: Context) -> TerminalContainerView {
+        let container = TerminalContainerView()
         let tv = AgentMonitorTerminalView(frame: .zero)
         tv.nativeBackgroundColor = UIColor(red: 0.02, green: 0.024, blue: 0.02, alpha: 1)
         tv.nativeForegroundColor = UIColor(red: 0.86, green: 0.90, blue: 0.82, alpha: 1)
@@ -62,7 +63,8 @@ struct SwiftTermView: UIViewRepresentable {
 
         tv.terminalDelegate = context.coordinator
         context.coordinator.terminalView = tv
-        context.coordinator.installScrollGesture(on: tv)
+        container.install(terminalView: tv)
+        context.coordinator.installScrollGesture(on: container, terminalView: tv)
 
         service.onData = { [weak tv] text in
             tv?.feed(text: text)
@@ -92,12 +94,12 @@ struct SwiftTermView: UIViewRepresentable {
             ))
         }
 
-        return tv
+        return container
     }
 
-    func updateUIView(_ uiView: TerminalView, context: Context) {}
+    func updateUIView(_ uiView: TerminalContainerView, context: Context) {}
 
-    static func dismantleUIView(_ uiView: TerminalView, coordinator: Coordinator) {
+    static func dismantleUIView(_ uiView: TerminalContainerView, coordinator: Coordinator) {
         coordinator.invalidate()
         let svc = coordinator.service
         MainActor.assumeIsolated { svc.disconnect() }
@@ -133,19 +135,15 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         @MainActor
-        func installScrollGesture(on terminalView: TerminalView) {
+        func installScrollGesture(on hostView: UIView, terminalView: TerminalView) {
             let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
-            gesture.cancelsTouchesInView = true
+            gesture.cancelsTouchesInView = false
             gesture.delaysTouchesBegan = false
             gesture.delaysTouchesEnded = false
             gesture.maximumNumberOfTouches = 1
             gesture.delegate = self
-            if let terminalView = terminalView as? AgentMonitorTerminalView {
-                terminalView.remoteScrollGesture = gesture
-            }
-            terminalView.addGestureRecognizer(gesture)
+            hostView.addGestureRecognizer(gesture)
             terminalView.panGestureRecognizer.isEnabled = false
-            terminalView.panGestureRecognizer.require(toFail: gesture)
             (terminalView as? AgentMonitorTerminalView)?.disableNativePanGestures()
             scrollGesture = gesture
         }
@@ -313,9 +311,34 @@ struct SwiftTermView: UIViewRepresentable {
     }
 }
 
-private final class AgentMonitorTerminalView: TerminalView {
-    weak var remoteScrollGesture: UIPanGestureRecognizer?
+final class TerminalContainerView: UIView {
+    private(set) weak var terminalView: TerminalView?
 
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        backgroundColor = .black
+    }
+
+    @MainActor
+    func install(terminalView: TerminalView) {
+        self.terminalView = terminalView
+        terminalView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(terminalView)
+        NSLayoutConstraint.activate([
+            terminalView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            terminalView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            terminalView.topAnchor.constraint(equalTo: topAnchor),
+            terminalView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+}
+
+private final class AgentMonitorTerminalView: TerminalView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         installKeyboardDismissalObserver()
@@ -370,7 +393,6 @@ private final class AgentMonitorTerminalView: TerminalView {
 
     private func disableNativePanGestureIfNeeded(_ gesture: UIGestureRecognizer) {
         guard let pan = gesture as? UIPanGestureRecognizer else { return }
-        guard pan !== remoteScrollGesture else { return }
         pan.isEnabled = false
     }
 }
@@ -393,6 +415,6 @@ extension SwiftTermView.Coordinator: UIGestureRecognizerDelegate {
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        false
+        gestureRecognizer === scrollGesture || otherGestureRecognizer === scrollGesture
     }
 }
