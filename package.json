@@ -12,6 +12,8 @@
     "check:rust": "cargo check --manifest-path apps/apple/AgentMonitorService/Cargo.toml",
     "build:mac": "cd apps/apple && xcodegen generate && xcodebuild -project AgentMonitorApple.xcodeproj -scheme AgentMonitorMac -destination 'platform=macOS' build",
     "build:ios": "cd apps/apple && xcodegen generate && pod install && xcodebuild -workspace AgentMonitorApple.xcworkspace -scheme AgentMonitoriOS -destination 'platform=iOS Simulator,name=iPhone 17' build",
+    "tf": "apps/apple/scripts/upload-testflight.sh",
+    "upload:testflight": "apps/apple/scripts/upload-testflight.sh",
     "package:mac": "apps/apple/scripts/package-mac.sh"
   },
   "engines": {

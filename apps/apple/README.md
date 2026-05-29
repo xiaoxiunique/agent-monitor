@@ -86,28 +86,44 @@ Do not remove `TARGETED_DEVICE_FAMILY: "1"` unless the iPad layout and orientati
 
 ## TestFlight Upload
 
-Create a signed archive from the monorepo root:
+From the monorepo root, run the release helper:
 
 ```bash
-rm -rf output/AgentMonitoriOS.xcarchive
-xcodebuild \
-  -workspace apps/apple/AgentMonitorApple.xcworkspace \
-  -scheme AgentMonitoriOS \
-  -configuration Release \
-  -destination 'generic/platform=iOS' \
-  -archivePath output/AgentMonitoriOS.xcarchive \
-  -allowProvisioningUpdates \
-  archive
+npm run tf
 ```
 
-Before uploading, inspect the built app metadata that App Store Connect will validate:
+The script increments `AgentMonitoriOS` `CURRENT_PROJECT_VERSION`, runs the
+repository checks, regenerates the Xcode project, installs pods, creates a
+Release archive, uploads it to TestFlight, and waits for App Store Connect to
+return `VALID`.
+
+Common options:
 
 ```bash
-plutil -p "output/AgentMonitoriOS.xcarchive/Products/Applications/Agent Monitor.app/Info.plist" \
-  | rg 'UIDeviceFamily|UISupportedInterfaceOrientations|CFBundleIdentifier|CFBundleVersion|CFBundleShortVersionString' -C 2
+npm run tf -- --dry-run
+npm run tf -- --skip-checks
+npm run tf -- --build-number 44
+npm run tf -- --no-wait
 ```
 
-Expected values for the current iPhone-only build:
+The script expects an App Store Connect API key at:
+
+```txt
+~/.appstoreconnect/private_keys/AuthKey_2CS3637KB9.p8
+```
+
+Override these values when needed:
+
+```txt
+APP_STORE_CONNECT_API_KEY_ID
+APP_STORE_CONNECT_API_ISSUER_ID
+APP_STORE_CONNECT_API_KEY_PATH
+APP_STORE_TEAM_ID
+APP_STORE_APPLE_ID
+```
+
+Before uploading, the script checks the built app metadata that App Store
+Connect validates. Expected values for the current iPhone-only build:
 
 ```txt
 CFBundleIdentifier = dev.hcg.AgentMonitor
@@ -115,19 +131,7 @@ UIDeviceFamily = [1]
 UISupportedInterfaceOrientations = [UIInterfaceOrientationPortrait]
 ```
 
-Upload to App Store Connect with the export options plist:
-
-```bash
-rm -rf output/TestFlightExport
-xcodebuild \
-  -exportArchive \
-  -archivePath output/AgentMonitoriOS.xcarchive \
-  -exportPath output/TestFlightExport \
-  -exportOptionsPlist output/ExportOptions-TestFlight.plist \
-  -allowProvisioningUpdates
-```
-
-The local `output/ExportOptions-TestFlight.plist` used for uploads should contain:
+The generated `output/ExportOptions-TestFlight.plist` contains:
 
 ```txt
 destination = upload
