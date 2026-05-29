@@ -3,6 +3,13 @@ import UIKit
 import PhotosUI
 import ImageIO
 
+@MainActor
+private enum KeyboardDismissal {
+    static func dismiss() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+
 struct PaneDetailView: View {
     let pane: Pane
     let isLiveServer: Bool
@@ -71,6 +78,16 @@ struct PaneDetailView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 4) {
+                    Button {
+                        KeyboardDismissal.dismiss()
+                    } label: {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                            .font(.system(size: 16))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .accessibilityLabel("Hide keyboard")
+
                     Button(role: .destructive) {
                         showKillConfirmation = true
                     } label: {
@@ -3222,7 +3239,7 @@ private struct InputBar: View {
     }
 
     private func dismissKeyboard() {
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        KeyboardDismissal.dismiss()
     }
 
     private func mergedVoiceText(base: String, transcript: String) -> String {
@@ -4737,7 +4754,9 @@ private struct AutoScrollingTextView: UIViewRepresentable {
         textView.returnKeyType = .default
         textView.isEditable = isEditable
         textView.isSelectable = isEditable
+        textView.inputAccessoryView = context.coordinator.makeKeyboardAccessoryView()
         textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        context.coordinator.textView = textView
         return textView
     }
 
@@ -4769,9 +4788,31 @@ private struct AutoScrollingTextView: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate {
         var parent: AutoScrollingTextView
+        weak var textView: UITextView?
 
         init(_ parent: AutoScrollingTextView) {
             self.parent = parent
+        }
+
+        func makeKeyboardAccessoryView() -> UIToolbar {
+            let toolbar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
+            toolbar.items = [
+                UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
+                UIBarButtonItem(
+                    title: "Hide Keyboard",
+                    style: .done,
+                    target: self,
+                    action: #selector(dismissKeyboard)
+                )
+            ]
+            toolbar.sizeToFit()
+            return toolbar
+        }
+
+        @MainActor
+        @objc private func dismissKeyboard() {
+            textView?.resignFirstResponder()
+            KeyboardDismissal.dismiss()
         }
 
         func textViewDidChange(_ textView: UITextView) {
