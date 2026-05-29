@@ -58,6 +58,7 @@ struct SwiftTermView: UIViewRepresentable {
         tv.alwaysBounceVertical = false
         tv.keyboardDismissMode = .interactive
         tv.allowMouseReporting = true
+        tv.inputAccessoryView = nil
 
         tv.terminalDelegate = context.coordinator
         context.coordinator.terminalView = tv
@@ -216,6 +217,20 @@ struct SwiftTermView: UIViewRepresentable {
 private final class AgentMonitorTerminalView: TerminalView {
     weak var remoteScrollGesture: UIPanGestureRecognizer?
 
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        installKeyboardDismissalObserver()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        installKeyboardDismissalObserver()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
     override func addGestureRecognizer(_ gestureRecognizer: UIGestureRecognizer) {
         super.addGestureRecognizer(gestureRecognizer)
         disableNativePanGestureIfNeeded(gestureRecognizer)
@@ -237,6 +252,21 @@ private final class AgentMonitorTerminalView: TerminalView {
         for gesture in gestureRecognizers ?? [] {
             disableNativePanGestureIfNeeded(gesture)
         }
+    }
+
+    private func installKeyboardDismissalObserver() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleKeyboardDismissalRequest),
+            name: KeyboardDismissal.requestNotification,
+            object: nil,
+        )
+    }
+
+    @objc private func handleKeyboardDismissalRequest() {
+        inputView = nil
+        reloadInputViews()
+        _ = resignFirstResponder()
     }
 
     private func disableNativePanGestureIfNeeded(_ gesture: UIGestureRecognizer) {

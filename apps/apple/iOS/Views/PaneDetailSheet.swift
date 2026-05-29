@@ -3,10 +3,13 @@ import UIKit
 import PhotosUI
 import ImageIO
 
-@MainActor
-private enum KeyboardDismissal {
+enum KeyboardDismissal {
+    static let requestNotification = Notification.Name("AgentMonitorKeyboardDismissalRequested")
+
+    @MainActor
     static func dismiss() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        NotificationCenter.default.post(name: requestNotification, object: nil)
     }
 }
 
