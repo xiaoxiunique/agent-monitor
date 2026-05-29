@@ -134,6 +134,9 @@ struct PaneDetailView: View {
         if isLiveServer {
             TerminalPaneView(pane: actionPane)
                 .background(Color.black)
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
+                .padding(.bottom, 6)
         } else {
             ContentUnavailableView {
                 Label("Terminal paused", systemImage: "terminal")
