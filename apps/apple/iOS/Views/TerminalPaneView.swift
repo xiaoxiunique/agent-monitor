@@ -56,7 +56,7 @@ struct SwiftTermView: UIViewRepresentable {
         tv.font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         tv.alwaysBounceVertical = true
         tv.keyboardDismissMode = .interactive
-        tv.allowMouseReporting = false
+        tv.allowMouseReporting = true
 
         tv.terminalDelegate = context.coordinator
         context.coordinator.terminalView = tv
@@ -106,6 +106,7 @@ struct SwiftTermView: UIViewRepresentable {
         weak var terminalView: TerminalView?
         private var scrollGesture: UIPanGestureRecognizer?
         private var pendingScrollDelta: CGFloat = 0
+        private var isTerminalScrollGestureActive = false
 
         init(service: TerminalWebSocketService) {
             self.service = service
@@ -114,9 +115,12 @@ struct SwiftTermView: UIViewRepresentable {
         @MainActor
         func installScrollGesture(on terminalView: TerminalView) {
             let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
-            gesture.cancelsTouchesInView = false
+            gesture.cancelsTouchesInView = true
+            gesture.delaysTouchesBegan = false
+            gesture.delaysTouchesEnded = false
             gesture.delegate = self
             terminalView.addGestureRecognizer(gesture)
+            terminalView.panGestureRecognizer.require(toFail: gesture)
             scrollGesture = gesture
         }
 
@@ -128,8 +132,10 @@ struct SwiftTermView: UIViewRepresentable {
 
             switch gesture.state {
             case .began:
+                isTerminalScrollGestureActive = true
                 pendingScrollDelta = 0
             case .changed:
+                isTerminalScrollGestureActive = true
                 let cellHeight = max(terminalView.caretFrame.height, 12)
                 pendingScrollDelta += translation.y / cellHeight
                 let wholeLines = Int(pendingScrollDelta)
@@ -138,6 +144,7 @@ struct SwiftTermView: UIViewRepresentable {
                 sendScroll(lines: wholeLines)
             case .ended, .cancelled, .failed:
                 pendingScrollDelta = 0
+                isTerminalScrollGestureActive = false
             default:
                 break
             }
@@ -151,6 +158,9 @@ struct SwiftTermView: UIViewRepresentable {
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let str = String(bytes: data, encoding: .utf8) ?? ""
             guard !str.isEmpty else { return }
+            if isTerminalScrollGestureActive && Self.isCursorKeyInput(str) {
+                return
+            }
             let svc = service
             MainActor.assumeIsolated { svc.sendInput(str) }
         }
@@ -182,14 +192,31 @@ struct SwiftTermView: UIViewRepresentable {
         func clipboardRead(source: TerminalView) -> Data? { nil }
         func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
         func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+
+        private static func isCursorKeyInput(_ value: String) -> Bool {
+            value == "\u{001B}[A" ||
+                value == "\u{001B}[B" ||
+                value == "\u{001B}OA" ||
+                value == "\u{001B}OB"
+        }
     }
 }
 
 extension SwiftTermView.Coordinator: UIGestureRecognizerDelegate {
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === scrollGesture,
+              let pan = gestureRecognizer as? UIPanGestureRecognizer,
+              let terminalView else {
+            return true
+        }
+        let velocity = pan.velocity(in: terminalView)
+        return abs(velocity.y) > abs(velocity.x)
+    }
+
     func gestureRecognizer(
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        true
+        false
     }
 }
