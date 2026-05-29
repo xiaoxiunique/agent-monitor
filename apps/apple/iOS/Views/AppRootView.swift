@@ -8,21 +8,21 @@ struct AppRootView: View {
 
     var body: some View {
         Group {
-            if settings.hasCompletedOnboarding {
-                MonitorView()
-                    .task {
-                        UIApplication.shared.isIdleTimerDisabled = settings.keepScreenAwake
-                        applyBackgroundAudioSetting(settings.backgroundAudioKeepAlive)
-                        store.start()
-                    }
-                    .onDisappear {
-                        UIApplication.shared.isIdleTimerDisabled = false
-                        backgroundAudio.setEnabled(false)
-                        store.stop()
-                    }
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_SCROLL_UITEST") {
+                TerminalScrollUITestHarnessView()
+            } else if settings.hasCompletedOnboarding {
+                monitorView
             } else {
                 OnboardingView()
             }
+            #else
+            if settings.hasCompletedOnboarding {
+                monitorView
+            } else {
+                OnboardingView()
+            }
+            #endif
         }
         .environment(backgroundAudio)
         .onChange(of: settings.hasCompletedOnboarding) { _, completed in
@@ -47,6 +47,20 @@ struct AppRootView: View {
             settings.backgroundAudioKeepAlive = false
             return
         }
+    }
+
+    private var monitorView: some View {
+        MonitorView()
+            .task {
+                UIApplication.shared.isIdleTimerDisabled = settings.keepScreenAwake
+                applyBackgroundAudioSetting(settings.backgroundAudioKeepAlive)
+                store.start()
+            }
+            .onDisappear {
+                UIApplication.shared.isIdleTimerDisabled = false
+                backgroundAudio.setEnabled(false)
+                store.stop()
+            }
     }
 }
 

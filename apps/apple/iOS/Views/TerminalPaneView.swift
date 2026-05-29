@@ -64,7 +64,7 @@ struct SwiftTermView: UIViewRepresentable {
         tv.terminalDelegate = context.coordinator
         context.coordinator.terminalView = tv
         container.install(terminalView: tv)
-        context.coordinator.installScrollGesture(on: container, terminalView: tv)
+        context.coordinator.installInputGestures(on: container.touchCaptureView, terminalView: tv)
 
         service.onData = { [weak tv] text in
             tv?.feed(text: text)
@@ -109,8 +109,11 @@ struct SwiftTermView: UIViewRepresentable {
         // Safe: TerminalViewDelegate is called on main thread, service is @MainActor
         let service: TerminalWebSocketService
         weak var terminalView: TerminalView?
+        private weak var inputGestureHostView: UIView?
         private var scrollGesture: UIPanGestureRecognizer?
+        private var focusTapGesture: UITapGestureRecognizer?
         private var pendingScrollDelta: CGFloat = 0
+        private var hasReportedScrollForCurrentGesture = false
         private var isTerminalScrollGestureActive = false
         private var queuedScrollLines = 0
         private var scrollFlushWorkItem: DispatchWorkItem?
@@ -135,9 +138,10 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         @MainActor
-        func installScrollGesture(on hostView: UIView, terminalView: TerminalView) {
+        func installInputGestures(on hostView: UIView, terminalView: TerminalView) {
+            inputGestureHostView = hostView
             let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
-            gesture.cancelsTouchesInView = false
+            gesture.cancelsTouchesInView = true
             gesture.delaysTouchesBegan = false
             gesture.delaysTouchesEnded = false
             gesture.maximumNumberOfTouches = 1
@@ -146,6 +150,15 @@ struct SwiftTermView: UIViewRepresentable {
             terminalView.panGestureRecognizer.isEnabled = false
             (terminalView as? AgentMonitorTerminalView)?.disableNativePanGestures()
             scrollGesture = gesture
+
+            let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleFocusTap(_:)))
+            tapGesture.cancelsTouchesInView = true
+            tapGesture.delaysTouchesBegan = false
+            tapGesture.delaysTouchesEnded = false
+            tapGesture.delegate = self
+            tapGesture.require(toFail: gesture)
+            hostView.addGestureRecognizer(tapGesture)
+            focusTapGesture = tapGesture
         }
 
         @MainActor
@@ -159,6 +172,8 @@ struct SwiftTermView: UIViewRepresentable {
                 stopInertia()
                 isTerminalScrollGestureActive = true
                 pendingScrollDelta = 0
+                hasReportedScrollForCurrentGesture = false
+                updateScrollAccessibilityValue("began")
             case .changed:
                 isTerminalScrollGestureActive = true
                 let cellHeight = max(terminalView.caretFrame.height, 12)
@@ -167,15 +182,26 @@ struct SwiftTermView: UIViewRepresentable {
                 guard wholeLines != 0 else { return }
                 pendingScrollDelta -= CGFloat(wholeLines)
                 queueScroll(lines: wholeLines)
+                hasReportedScrollForCurrentGesture = true
+                updateScrollAccessibilityValue("scroll:\(wholeLines)")
             case .ended, .cancelled, .failed:
                 let cellHeight = max(terminalView.caretFrame.height, 12)
                 let velocity = gesture.velocity(in: terminalView).y / cellHeight
                 startInertia(velocityLinesPerSecond: velocity)
                 pendingScrollDelta = 0
                 isTerminalScrollGestureActive = false
+                if !hasReportedScrollForCurrentGesture {
+                    updateScrollAccessibilityValue("ended")
+                }
             default:
                 break
             }
+        }
+
+        @MainActor
+        @objc private func handleFocusTap(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended else { return }
+            _ = terminalView?.becomeFirstResponder()
         }
 
         private func queueScroll(lines: Int) {
@@ -260,6 +286,12 @@ struct SwiftTermView: UIViewRepresentable {
             MainActor.assumeIsolated { svc.sendScroll(lines: lines) }
         }
 
+        @MainActor
+        private func updateScrollAccessibilityValue(_ value: String) {
+            guard inputGestureHostView?.isAccessibilityElement == true else { return }
+            inputGestureHostView?.accessibilityValue = value
+        }
+
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let str = String(bytes: data, encoding: .utf8) ?? ""
             guard !str.isEmpty else { return }
@@ -313,15 +345,18 @@ struct SwiftTermView: UIViewRepresentable {
 
 final class TerminalContainerView: UIView {
     private(set) weak var terminalView: TerminalView?
+    let touchCaptureView = UIView()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
+        configureTouchCaptureView()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         backgroundColor = .black
+        configureTouchCaptureView()
     }
 
     @MainActor
@@ -329,12 +364,29 @@ final class TerminalContainerView: UIView {
         self.terminalView = terminalView
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(terminalView)
+        addSubview(touchCaptureView)
         NSLayoutConstraint.activate([
             terminalView.leadingAnchor.constraint(equalTo: leadingAnchor),
             terminalView.trailingAnchor.constraint(equalTo: trailingAnchor),
             terminalView.topAnchor.constraint(equalTo: topAnchor),
             terminalView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            touchCaptureView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            touchCaptureView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            touchCaptureView.topAnchor.constraint(equalTo: topAnchor),
+            touchCaptureView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+    }
+
+    private func configureTouchCaptureView() {
+        touchCaptureView.translatesAutoresizingMaskIntoConstraints = false
+        touchCaptureView.backgroundColor = .clear
+        touchCaptureView.isUserInteractionEnabled = true
+        if ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_SCROLL_UITEST") {
+            touchCaptureView.isAccessibilityElement = true
+            touchCaptureView.accessibilityIdentifier = "terminal-touch-capture"
+            touchCaptureView.accessibilityLabel = "Terminal touch capture"
+            touchCaptureView.accessibilityValue = "idle"
+        }
     }
 }
 
@@ -415,6 +467,16 @@ extension SwiftTermView.Coordinator: UIGestureRecognizerDelegate {
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        gestureRecognizer === scrollGesture || otherGestureRecognizer === scrollGesture
+        if gestureRecognizer === focusTapGesture || otherGestureRecognizer === focusTapGesture {
+            return false
+        }
+        return gestureRecognizer === scrollGesture || otherGestureRecognizer === scrollGesture
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === focusTapGesture && otherGestureRecognizer === scrollGesture
     }
 }

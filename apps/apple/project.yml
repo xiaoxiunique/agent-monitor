@@ -69,3 +69,33 @@ targets:
         NSMicrophoneUsageDescription: Agent Monitor uses the microphone to turn your voice into text before sending it to the agent.
         NSPhotoLibraryUsageDescription: Agent Monitor lets you choose images to send to the agent running on your Mac.
         NSSpeechRecognitionUsageDescription: Agent Monitor uses speech recognition to transcribe voice input into the message field.
+  AgentMonitoriOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - iOSUITests
+    dependencies:
+      - target: AgentMonitoriOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.hcg.AgentMonitorUITests
+        PRODUCT_NAME: Agent Monitor UI Tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: AgentMonitoriOS
+schemes:
+  AgentMonitoriOS:
+    build:
+      targets:
+        AgentMonitoriOS: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  AgentMonitoriOSUITests:
+    build:
+      targets:
+        AgentMonitoriOS: all
+        AgentMonitoriOSUITests: [test]
+    test:
+      targets:
+        - AgentMonitoriOSUITests
