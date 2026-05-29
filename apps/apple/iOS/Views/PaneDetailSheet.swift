@@ -11,14 +11,9 @@ struct PaneDetailView: View {
     @Environment(MonitorStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
-    @State private var inputText = ""
-    @State private var vimMode = false
     @State private var showKillConfirmation = false
-    @State private var showTerminal = false
     @State private var showInfo = false
     @State private var actionPane: Pane
-    @State private var logRefreshHint: PaneLogRefreshHint?
-    @State private var userMessages: [UserInteractionMessage] = []
 
     init(pane: Pane, isLiveServer: Bool = true, serverName: String = "Server") {
         self.pane = pane
@@ -32,26 +27,9 @@ struct PaneDetailView: View {
     }
 
     var body: some View {
-        AgentChatTimelineContainer(
-            initialPane: pane,
-            isLiveServer: isLiveServer,
-            userMessages: userMessages,
-            onOpenTerminal: { openTerminalIfLive() },
-            onSendAction: { payload in
-                guard isLiveServer else { return false }
-                let response = await store.sendText(payload, to: actionPane, vimMode: false)
-                applyCommandLogHint(response)
-                return response?.ok == true
-            }
-        )
-        .padding(.horizontal, 12)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
+        terminalContent
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            AgentMonitorTheme.backgroundGradient(for: colorScheme)
-                .ignoresSafeArea()
-        )
+        .background(Color.black.ignoresSafeArea())
         .safeAreaInset(edge: .top, spacing: 0) {
             if !isLiveServer {
                 StaleServerBanner(serverName: serverName)
@@ -59,48 +37,21 @@ struct PaneDetailView: View {
                     .padding(.bottom, 8)
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            InputBar(
-                pane: actionPane,
-                isEnabled: isLiveServer,
-                inputText: $inputText,
-                vimMode: $vimMode,
-                showKillConfirmation: $showKillConfirmation,
-                onSendText: { text in
-                    guard isLiveServer else { return false }
-                    let response = await store.sendText(text, to: actionPane, vimMode: vimMode)
-                    applyCommandLogHint(response)
-                    return response?.ok == true
-                },
-                onUserMessageSent: rememberUserMessage,
-                onRefineText: { text in
-                    await store.refineText(text)
-                },
-                onSendKey: { key in
-                    guard isLiveServer else { return false }
-                    let response = await store.sendKey(key, to: actionPane)
-                    applyCommandLogHint(response)
-                    return response?.ok == true
-                },
-                onUploadImage: { imageData in
-                    guard isLiveServer else { throw CancellationError() }
-                    return try await store.uploadImage(imageData, to: actionPane)
-                }
-            )
-        }
         .navigationTitle(projectName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 4) {
-                    Button { openTerminalIfLive() } label: {
-                        Image(systemName: "terminal")
+                    Button(role: .destructive) {
+                        showKillConfirmation = true
+                    } label: {
+                        Image(systemName: "xmark.rectangle")
                             .font(.system(size: 16))
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
                     }
                     .disabled(!isLiveServer)
-                    .accessibilityLabel("Open terminal")
+                    .accessibilityLabel("Close pane")
 
                     Button { showInfo = true } label: {
                         Image(systemName: "info.circle")
@@ -132,18 +83,6 @@ struct PaneDetailView: View {
         } message: {
             Text("This closes this tmux pane. Other panes in the same project stay available.")
         }
-        .sheet(isPresented: $showTerminal) {
-            NavigationStack {
-                TerminalPaneView(pane: actionPane)
-                    .navigationTitle("Terminal")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button("Done") { showTerminal = false }
-                        }
-                    }
-            }
-        }
         .sheet(isPresented: $showInfo) {
             NavigationStack {
                 PaneInfoView(pane: actionPane)
@@ -161,33 +100,23 @@ struct PaneDetailView: View {
         }
     }
 
-    private func applyCommandLogHint(_ response: PaneCommandResponse?) {
-        guard let response,
-              response.ok,
-              response.paneId == actionPane.id,
-              let tail = response.tail,
-              let capturedAt = response.capturedAt
-        else { return }
-
-        logRefreshHint = PaneLogRefreshHint(paneId: actionPane.id, tail: tail, capturedAt: capturedAt)
-    }
-
-    private func rememberUserMessage(_ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let message = UserInteractionMessage(text: trimmed, sentAt: Date())
-        userMessages.append(message)
-        if userMessages.count > 40 {
-            userMessages.removeFirst(userMessages.count - 40)
+    @ViewBuilder
+    private var terminalContent: some View {
+        if isLiveServer {
+            TerminalPaneView(pane: actionPane)
+                .background(Color.black)
+        } else {
+            ContentUnavailableView {
+                Label("Terminal paused", systemImage: "terminal")
+            } description: {
+                Text("Switch to \(serverName) before opening an interactive terminal.")
+            }
+            .foregroundStyle(.white)
+            .background(
+                AgentMonitorTheme.backgroundGradient(for: colorScheme)
+                    .ignoresSafeArea()
+            )
         }
-    }
-
-    private func openTerminalIfLive() {
-        guard isLiveServer else {
-            Haptics.sent(success: false)
-            return
-        }
-        showTerminal = true
     }
 }
 
