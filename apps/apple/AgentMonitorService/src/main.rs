@@ -1785,6 +1785,7 @@ async fn api_send(
         })
         .or(requested_submit_key);
     let previous_tail = capture_pane_lines(&body.pane_id, PANE_COMMAND_TAIL_LINE_COUNT);
+    exit_tmux_copy_mode(&body.pane_id);
 
     if body.vim_mode.unwrap_or(false) {
         if let Err(error) = send_key_parts(&body.pane_id, &["C-[", "i"]) {
@@ -1942,6 +1943,7 @@ async fn api_key(
     }
 
     let previous_tail = capture_pane_lines(&pane_id, PANE_COMMAND_TAIL_LINE_COUNT);
+    exit_tmux_copy_mode(&pane_id);
 
     let result = match key.as_str() {
         "VimClear" => send_key_parts(&pane_id, &["C-[", "0", "D", "i"]),

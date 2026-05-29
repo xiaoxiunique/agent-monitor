@@ -1025,6 +1025,8 @@ async function handleSend(req: IncomingMessage, res: ServerResponse): Promise<vo
   const submitKey = pane && isCodexPane(pane) ? "Tab" : requestedSubmitKey;
   const previousTail = capturePane(body.paneId, paneCommandTailLineCount);
 
+  exitTmuxCopyMode(body.paneId);
+
   if (body.vimMode) {
     const escape = runTmux(["send-keys", "-t", body.paneId, "C-["]);
     if (!escape.ok) return sendJson(res, { error: escape.error }, 500);
@@ -1107,6 +1109,7 @@ async function handleKey(req: IncomingMessage, res: ServerResponse): Promise<voi
   }
 
   const previousTail = capturePane(paneId, paneCommandTailLineCount);
+  exitTmuxCopyMode(paneId);
 
   if (key === "VimClear") {
     for (const part of ["C-[", "0", "D", "i"]) {
