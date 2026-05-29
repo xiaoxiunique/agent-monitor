@@ -49,6 +49,7 @@ struct PaneDetailView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             InputBar(
                 pane: actionPane,
+                serverName: serverName,
                 isEnabled: isLiveServer,
                 inputText: $inputText,
                 vimMode: $vimMode,
@@ -151,9 +152,9 @@ struct PaneDetailView: View {
         if isLiveServer {
             TerminalPaneView(pane: actionPane)
                 .background(Color.black)
-                .padding(.horizontal, 10)
-                .padding(.top, 8)
-                .padding(.bottom, 6)
+                .padding(.horizontal, 3)
+                .padding(.top, 2)
+                .padding(.bottom, 0)
         } else {
             ContentUnavailableView {
                 Label("Terminal paused", systemImage: "terminal")
@@ -2421,6 +2422,7 @@ private func cleanTaskTitle(_ value: String) -> String {
 
 private struct InputBar: View {
     let pane: Pane
+    let serverName: String
     let isEnabled: Bool
     @Environment(AppSettings.self) private var settings
     @Environment(BackgroundAudioKeepAlive.self) private var backgroundAudio
@@ -2482,9 +2484,15 @@ private struct InputBar: View {
     }
 
     private let quickKeys: [(String, String)] = [
+        ("ESC", "C-["),
         ("Enter", "Enter"),
-        ("Esc", "C-["),
-        ("C-c", "C-c")
+        ("TAB", "Tab"),
+        ("C-c", "C-c"),
+        ("C-d", "C-d"),
+        ("C-u", "C-u"),
+        ("↑", "Up"),
+        ("↓", "Down"),
+        ("⌫", "BSpace")
     ]
 
     private var isLongDraft: Bool {
@@ -2580,10 +2588,10 @@ private struct InputBar: View {
     }
 
     private var normalInputStack: some View {
-        VStack(spacing: 10) {
-            accessoryActionTray
-
+        VStack(spacing: 8) {
             composerSurface
+
+            terminalAccessoryPanel
 
             if !isEnabled {
                 Label("Snapshot only. Switch to this machine before sending commands.", systemImage: "lock.fill")
@@ -2608,8 +2616,18 @@ private struct InputBar: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
+        .padding(.horizontal, 8)
         .padding(.top, 8)
-        .padding(.bottom, 10)
+        .padding(.bottom, 8)
+        .background {
+            terminalPanelColor
+                .ignoresSafeArea(edges: .bottom)
+        }
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(AgentMonitorTheme.separator(for: colorScheme).opacity(0.9))
+                .frame(height: 1)
+        }
     }
 
     @ViewBuilder
@@ -2642,88 +2660,148 @@ private struct InputBar: View {
         }
     }
 
-    @ViewBuilder
-    private var accessoryActionTray: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 7) {
-                goalModeButton
+    private var terminalAccessoryPanel: some View {
+        VStack(spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    terminalIconButton(
+                        systemImage: "keyboard.chevron.compact.down",
+                        accessibilityLabel: "Hide keyboard",
+                        action: dismissKeyboard
+                    )
 
-                if pane.session.hasPrefix("cc_") {
-                    Button {
-                        vimMode.toggle()
-                    } label: {
-                        Text(vimMode ? "vim on" : "vim off")
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .foregroundColor(vimMode ? .white : .secondary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .frame(minHeight: 36)
-                            .background(vimMode ? Color.accentColor : AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
+                    TerminalServerPill(title: serverName)
+
+                    goalModeButton
+
+                    if pane.session.hasPrefix("cc_") {
+                        vimModeButton
                     }
-                    .buttonStyle(.plain)
-                    .disabled(isInputBusy)
-                }
 
-                ForEach(quickMessages, id: \.self) { message in
-                    Button(message) {
-                        Task { await sendPresetText(message) }
+                    ForEach(quickMessages, id: \.self) { message in
+                        terminalTextActionButton(message) {
+                            Task { await sendPresetText(message) }
+                        }
                     }
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.primary.opacity(0.82))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .frame(minHeight: 36)
-                    .background(AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
-                    .buttonStyle(.plain)
-                    .disabled(isInputBusy)
-                }
 
-                ForEach(quickKeys, id: \.0) { title, key in
-                    Button(title) {
-                        Task { _ = await onSendKey(key) }
-                    }
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .frame(minHeight: 36)
-                    .background(AgentMonitorTheme.softFill(for: colorScheme), in: Capsule())
-                    .buttonStyle(.plain)
-                    .disabled(isInputBusy)
+                    closePaneShortcutButton
                 }
-
-                Button(role: .destructive) {
-                    showKillConfirmation = true
-                } label: {
-                    Label("Close", systemImage: "xmark.circle")
-                        .font(.system(size: 12, weight: .semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .frame(minHeight: 36)
-                }
-                .buttonStyle(.plain)
-                .disabled(isInputBusy)
+                .padding(.horizontal, 1)
             }
-            .padding(.horizontal, 18)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(quickKeys, id: \.0) { title, key in
+                        terminalKeyButton(title) {
+                            Task { _ = await onSendKey(key) }
+                        }
+                    }
+
+                    if pane.session.hasPrefix("cc_") {
+                        terminalKeyButton("vim ⌫") {
+                            Task { _ = await onSendKey("VimBackspace") }
+                        }
+
+                        terminalKeyButton("vim clr") {
+                            Task { _ = await onSendKey("VimClear") }
+                        }
+                    }
+                }
+                .padding(.horizontal, 1)
+            }
         }
+    }
+
+    private var terminalPanelColor: Color {
+        colorScheme == .dark
+            ? Color(red: 0.21, green: 0.21, blue: 0.22)
+            : Color(.secondarySystemGroupedBackground)
+    }
+
+    private var terminalFieldColor: Color {
+        colorScheme == .dark
+            ? Color(red: 0.15, green: 0.15, blue: 0.16)
+            : Color(.systemBackground)
+    }
+
+    private var vimModeButton: some View {
+        terminalTextActionButton(vimMode ? "vim on" : "vim off", isSelected: vimMode) {
+            vimMode.toggle()
+        }
+    }
+
+    private var closePaneShortcutButton: some View {
+        Button(role: .destructive) {
+            showKillConfirmation = true
+        } label: {
+            TerminalAccessoryLabel(
+                title: "Close",
+                systemImage: "xmark.circle",
+                isActive: isEnabled,
+                isDestructive: true
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isInputBusy)
+        .accessibilityLabel("Close pane")
+    }
+
+    private func terminalTextActionButton(
+        _ title: String,
+        isActive: Bool = true,
+        isSelected: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            TerminalAccessoryLabel(title: title, isActive: isActive, isSelected: isSelected)
+        }
+        .buttonStyle(.plain)
+        .disabled(isInputBusy)
+    }
+
+    private func terminalKeyButton(
+        _ title: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            TerminalAccessoryLabel(
+                title: title,
+                isActive: isEnabled,
+                usesMonospacedFont: true
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isInputBusy)
+        .accessibilityLabel("Send \(title)")
+    }
+
+    private func terminalIconButton(
+        systemImage: String,
+        accessibilityLabel: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            TerminalAccessoryLabel(
+                title: nil,
+                systemImage: systemImage,
+                isActive: isEnabled
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private var goalModeButton: some View {
         Button {
             toggleGoalMode()
         } label: {
-            Label(isGoalModeEnabled ? "Goal on" : "Goal", systemImage: "target")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(isGoalModeEnabled ? .white : .secondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .frame(minHeight: 36)
-                .background(
-                    isGoalModeEnabled
-                        ? Color.accentColor
-                        : AgentMonitorTheme.softFill(for: colorScheme),
-                    in: Capsule()
-                )
+            TerminalAccessoryLabel(
+                title: isGoalModeEnabled ? "Goal on" : "Goal",
+                systemImage: "target",
+                isActive: true,
+                isSelected: isGoalModeEnabled
+            )
         }
         .buttonStyle(.plain)
         .disabled(isInputBusy)
@@ -2779,13 +2857,12 @@ private struct InputBar: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 52)
-        .background(AgentMonitorTheme.elevatedSurface(for: colorScheme).opacity(0.92), in: Capsule())
+        .frame(maxWidth: .infinity)
+        .background(terminalFieldColor, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
-            Capsule()
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
         )
-        .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 14 : 10, x: 0, y: 4)
-        .padding(.horizontal, 18)
         .onAppear {
             guard isEnabled else { return }
             scheduleVoiceInputPrepare(force: true, after: .zero)
@@ -2812,7 +2889,8 @@ private struct InputBar: View {
                 text: $inputText,
                 measuredHeight: $composerTextHeight,
                 maxLines: composerMaxLines,
-                isEditable: isEnabled
+                isEditable: isEnabled,
+                placeholder: "这里输入..."
             )
             .frame(height: composerTextHeight)
             .padding(.horizontal, 2)
@@ -2856,13 +2934,12 @@ private struct InputBar: View {
         }
         .padding(.horizontal, 8)
         .frame(minHeight: 52)
-        .background(AgentMonitorTheme.elevatedSurface(for: colorScheme).opacity(0.92), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .frame(maxWidth: .infinity)
+        .background(terminalFieldColor, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
         )
-        .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 14 : 10, x: 0, y: 4)
-        .padding(.horizontal, 18)
     }
 
     private func imagePickerButton(
@@ -3384,11 +3461,131 @@ private struct ImageSendFeedback: Identifiable, Equatable {
     }
 }
 
+private struct TerminalServerPill: View {
+    let title: String
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var displayTitle: String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Server" : trimmed
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "desktopcomputer")
+                .font(.system(size: 16, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+
+            Text(displayTitle)
+                .font(.system(size: 14, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .foregroundColor(.primary.opacity(0.84))
+        .padding(.horizontal, 12)
+        .frame(minWidth: 74, maxWidth: 132, minHeight: 44)
+        .background(serverFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connected server \(displayTitle)")
+    }
+
+    private var serverFill: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.13)
+            : Color.black.opacity(0.06)
+    }
+}
+
+private struct TerminalAccessoryLabel: View {
+    let title: String?
+    var systemImage: String?
+    var isActive = true
+    var isSelected = false
+    var isDestructive = false
+    var usesMonospacedFont = false
+
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.isEnabled) private var controlIsEnabled
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: iconSize, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+            }
+
+            if let title {
+                Text(title)
+                    .font(labelFont)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+        }
+        .foregroundColor(foregroundColor)
+        .padding(.horizontal, title == nil ? 0 : 10)
+        .frame(minWidth: minWidth, maxWidth: maxWidth, minHeight: 44)
+        .background(backgroundFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(strokeColor, lineWidth: 1)
+        )
+        .opacity(controlIsEnabled && isActive ? 1 : 0.46)
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var labelFont: Font {
+        usesMonospacedFont
+            ? .system(size: 15, weight: .semibold, design: .monospaced)
+            : .system(size: 14, weight: .semibold)
+    }
+
+    private var iconSize: CGFloat {
+        title == nil ? 20 : 15
+    }
+
+    private var minWidth: CGFloat {
+        guard let title else { return 52 }
+        if title.count <= 2 { return 52 }
+        if title.count <= 4 { return 58 }
+        return 72
+    }
+
+    private var maxWidth: CGFloat? {
+        guard let title else { return 52 }
+        return title.count > 10 ? 144 : nil
+    }
+
+    private var foregroundColor: Color {
+        if isSelected { return .white }
+        if isDestructive { return .red.opacity(colorScheme == .dark ? 0.9 : 0.82) }
+        return .primary.opacity(0.82)
+    }
+
+    private var backgroundFill: Color {
+        if isSelected { return Color.accentColor }
+        if colorScheme == .dark {
+            return Color.white.opacity(0.12)
+        }
+        return Color.black.opacity(0.06)
+    }
+
+    private var strokeColor: Color {
+        if isSelected { return Color.white.opacity(0.18) }
+        return AgentMonitorTheme.separator(for: colorScheme)
+    }
+}
+
 private struct AutoScrollingComposerTextView: View {
     @Binding var text: String
     @Binding var measuredHeight: CGFloat
     let maxLines: Int
     let isEditable: Bool
+    var placeholder = "Send to agent..."
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -3401,7 +3598,7 @@ private struct AutoScrollingComposerTextView: View {
             )
 
             if text.isEmpty {
-                Text(isEditable ? "Send to agent..." : "Read only")
+                Text(isEditable ? placeholder : "Read only")
                     .font(.system(size: 16))
                     .foregroundColor(Color(.placeholderText))
                     .padding(.top, 1)
