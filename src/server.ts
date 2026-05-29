@@ -137,7 +137,10 @@ function scrollTmuxPane(paneId: string, lines: number): void {
   const safeLines = Math.max(-200, Math.min(200, Math.trunc(lines)));
   if (safeLines === 0) return;
 
-  runTmux(["copy-mode", "-t", paneId]);
+  const mode = runTmux(["display-message", "-p", "-t", paneId, "#{pane_in_mode}"]);
+  if (!mode.ok || mode.stdout.trim() !== "1") {
+    runTmux(["copy-mode", "-t", paneId]);
+  }
   runTmux([
     "send-keys",
     "-t",

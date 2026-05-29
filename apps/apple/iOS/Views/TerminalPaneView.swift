@@ -98,6 +98,7 @@ struct SwiftTermView: UIViewRepresentable {
     func updateUIView(_ uiView: TerminalView, context: Context) {}
 
     static func dismantleUIView(_ uiView: TerminalView, coordinator: Coordinator) {
+        coordinator.invalidate()
         let svc = coordinator.service
         MainActor.assumeIsolated { svc.disconnect() }
     }
@@ -109,9 +110,26 @@ struct SwiftTermView: UIViewRepresentable {
         private var scrollGesture: UIPanGestureRecognizer?
         private var pendingScrollDelta: CGFloat = 0
         private var isTerminalScrollGestureActive = false
+        private var queuedScrollLines = 0
+        private var scrollFlushWorkItem: DispatchWorkItem?
+        private var inertiaDisplayLink: CADisplayLink?
+        private var inertiaVelocityLinesPerSecond: CGFloat = 0
+        private var inertiaRemainder: CGFloat = 0
+        private var lastInertiaTimestamp: CFTimeInterval = 0
 
         init(service: TerminalWebSocketService) {
             self.service = service
+        }
+
+        deinit {
+            invalidate()
+        }
+
+        func invalidate() {
+            scrollFlushWorkItem?.cancel()
+            scrollFlushWorkItem = nil
+            inertiaDisplayLink?.invalidate()
+            inertiaDisplayLink = nil
         }
 
         @MainActor
@@ -140,6 +158,7 @@ struct SwiftTermView: UIViewRepresentable {
 
             switch gesture.state {
             case .began:
+                stopInertia()
                 isTerminalScrollGestureActive = true
                 pendingScrollDelta = 0
             case .changed:
@@ -149,13 +168,93 @@ struct SwiftTermView: UIViewRepresentable {
                 let wholeLines = Int(pendingScrollDelta)
                 guard wholeLines != 0 else { return }
                 pendingScrollDelta -= CGFloat(wholeLines)
-                sendScroll(lines: wholeLines)
+                queueScroll(lines: wholeLines)
             case .ended, .cancelled, .failed:
+                let cellHeight = max(terminalView.caretFrame.height, 12)
+                let velocity = gesture.velocity(in: terminalView).y / cellHeight
+                startInertia(velocityLinesPerSecond: velocity)
                 pendingScrollDelta = 0
                 isTerminalScrollGestureActive = false
             default:
                 break
             }
+        }
+
+        private func queueScroll(lines: Int) {
+            guard lines != 0 else { return }
+            queuedScrollLines += lines
+            guard scrollFlushWorkItem == nil else { return }
+
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.flushQueuedScroll()
+            }
+            scrollFlushWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: workItem)
+        }
+
+        private func flushQueuedScroll() {
+            scrollFlushWorkItem = nil
+            guard queuedScrollLines != 0 else { return }
+
+            let chunk = max(-80, min(80, queuedScrollLines))
+            queuedScrollLines -= chunk
+            sendScroll(lines: chunk)
+
+            if queuedScrollLines != 0 {
+                let workItem = DispatchWorkItem { [weak self] in
+                    self?.flushQueuedScroll()
+                }
+                scrollFlushWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: workItem)
+            }
+        }
+
+        private func startInertia(velocityLinesPerSecond: CGFloat) {
+            stopInertia()
+            let clampedVelocity = max(-900, min(900, velocityLinesPerSecond))
+            guard abs(clampedVelocity) >= 18 else {
+                flushQueuedScroll()
+                return
+            }
+
+            inertiaVelocityLinesPerSecond = clampedVelocity
+            inertiaRemainder = pendingScrollDelta
+            lastInertiaTimestamp = 0
+
+            let displayLink = CADisplayLink(target: self, selector: #selector(handleInertiaFrame(_:)))
+            displayLink.add(to: .main, forMode: .common)
+            inertiaDisplayLink = displayLink
+        }
+
+        @objc private func handleInertiaFrame(_ displayLink: CADisplayLink) {
+            if lastInertiaTimestamp == 0 {
+                lastInertiaTimestamp = displayLink.timestamp
+                return
+            }
+
+            let elapsed = max(0.001, min(0.05, displayLink.timestamp - lastInertiaTimestamp))
+            lastInertiaTimestamp = displayLink.timestamp
+
+            let rawDelta = inertiaVelocityLinesPerSecond * CGFloat(elapsed) + inertiaRemainder
+            let wholeLines = Int(rawDelta)
+            inertiaRemainder = rawDelta - CGFloat(wholeLines)
+            if wholeLines != 0 {
+                queueScroll(lines: wholeLines)
+            }
+
+            inertiaVelocityLinesPerSecond *= pow(0.88, CGFloat(elapsed) * 60)
+            if abs(inertiaVelocityLinesPerSecond) < 8 {
+                stopInertia()
+                flushQueuedScroll()
+            }
+        }
+
+        private func stopInertia() {
+            inertiaDisplayLink?.invalidate()
+            inertiaDisplayLink = nil
+            inertiaVelocityLinesPerSecond = 0
+            inertiaRemainder = 0
+            lastInertiaTimestamp = 0
         }
 
         private func sendScroll(lines: Int) {

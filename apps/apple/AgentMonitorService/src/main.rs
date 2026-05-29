@@ -311,7 +311,18 @@ fn scroll_tmux_pane(pane_id: &str, lines: i32) {
         return;
     }
 
-    let _ = run_tmux(&["copy-mode".to_string(), "-t".to_string(), pane_id.to_string()]);
+    let is_in_mode = run_tmux(&[
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "#{pane_in_mode}".to_string(),
+    ])
+    .map(|output| output.stdout.trim() == "1")
+    .unwrap_or(false);
+    if !is_in_mode {
+        let _ = run_tmux(&["copy-mode".to_string(), "-t".to_string(), pane_id.to_string()]);
+    }
     let direction = if safe_lines > 0 {
         "scroll-up"
     } else {
