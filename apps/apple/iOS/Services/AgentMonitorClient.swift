@@ -44,6 +44,38 @@ struct PaneCommandResponse: Codable {
     let capturedAt: Date?
 }
 
+private struct ErrorResponse: Codable {
+    let error: String?
+}
+
+struct CcSwitchStatusResponse: Codable, Equatable {
+    let ok: Bool
+    let apps: [CcSwitchAppStatus]
+    let error: String?
+}
+
+struct CcSwitchAppStatus: Codable, Identifiable, Equatable {
+    let appType: String
+    let title: String
+    let activeProviderId: String?
+    let providers: [CcSwitchProvider]
+
+    var id: String { appType }
+
+    var activeProvider: CcSwitchProvider? {
+        providers.first { $0.id == activeProviderId || $0.isCurrent }
+    }
+}
+
+struct CcSwitchProvider: Codable, Identifiable, Equatable {
+    let id: String
+    let appType: String
+    let name: String
+    let isCurrent: Bool
+    let baseUrl: String?
+    let hasApiKey: Bool
+}
+
 struct AgentMonitorClient {
     let baseURL: URL
     let token: String
@@ -89,7 +121,7 @@ struct AgentMonitorClient {
         setAuthorizationHeader(on: &request)
 
         let (data, response) = try await session.upload(for: request, from: imageData)
-        try validate(response)
+        try validate(response, data: data)
         return try Self.decode(UploadedImageResponse.self, from: data)
     }
 
@@ -105,7 +137,7 @@ struct AgentMonitorClient {
         request.httpMethod = "POST"
         setAuthorizationHeader(on: &request)
         let (data, response) = try await session.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
         return try Self.decode(PaneCommandResponse.self, from: data)
     }
 
@@ -127,7 +159,7 @@ struct AgentMonitorClient {
         setAuthorizationHeader(on: &request)
 
         let (data, response) = try await session.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
         return try Self.decode(PaneContextResponse.self, from: data)
     }
 
@@ -145,8 +177,25 @@ struct AgentMonitorClient {
         setAuthorizationHeader(on: &request)
 
         let (data, response) = try await session.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
         return try Self.decode(AgentEventsResponse.self, from: data)
+    }
+
+    func ccSwitchStatus() async throws -> CcSwitchStatusResponse {
+        let data = try await data(path: "/api/cc-switch", method: "GET")
+        return try Self.decode(CcSwitchStatusResponse.self, from: data)
+    }
+
+    func switchCcProvider(appType: String, providerId: String) async throws -> CcSwitchStatusResponse {
+        let data = try await data(
+            path: "/api/cc-switch/switch",
+            method: "POST",
+            body: [
+                "appType": appType,
+                "providerId": providerId
+            ]
+        )
+        return try Self.decode(CcSwitchStatusResponse.self, from: data)
     }
 
     func snapshotWebSocketRequest() throws -> URLRequest {
@@ -173,7 +222,7 @@ struct AgentMonitorClient {
         }
 
         let (data, response) = try await session.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
         return data
     }
 
@@ -190,17 +239,33 @@ struct AgentMonitorClient {
         }
     }
 
-    private func validate(_ response: URLResponse) throws {
+    private func validate(_ response: URLResponse, data: Data? = nil) throws {
         guard let http = response as? HTTPURLResponse else {
             throw AgentMonitorError.invalidResponse
         }
         guard (200..<300).contains(http.statusCode) else {
+            if let message = Self.serverErrorMessage(from: data) {
+                throw AgentMonitorError.server(message)
+            }
             throw AgentMonitorError.server("HTTP \(http.statusCode)")
         }
     }
 
     static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         try makeDecoder().decode(type, from: data)
+    }
+
+    private static func serverErrorMessage(from data: Data?) -> String? {
+        guard let data, !data.isEmpty else { return nil }
+        if let response = try? JSONDecoder().decode(ErrorResponse.self, from: data),
+           let error = response.error?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !error.isEmpty {
+            return error
+        }
+
+        let raw = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? nil : raw
     }
 
     private static func makeDecoder() -> JSONDecoder {

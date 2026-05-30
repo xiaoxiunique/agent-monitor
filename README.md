@@ -109,6 +109,7 @@ This is intentionally small:
 - simple status inference
 - text reply
 - Goal mode input wrapper for long-running agent tasks
+- CC Switch provider status and switching for Claude Code / Codex from iOS Settings
 - quick keys: Enter, Delete, Clear line, Ctrl-C, Ctrl-D, Esc
 - Vim mode input: sends `Esc`, enters insert mode, pastes text, then submits
 - native terminal view through SwiftTerm and `WS /terminal/ws`

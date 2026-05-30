@@ -49,6 +49,19 @@ AppID default only; enter `SecretId` and `SecretKey` on device before using Tenc
 Do not commit Tencent `SecretKey` or other long-lived credentials. A server-issued STS
 temporary credential flow is the preferred production direction.
 
+## iOS CC Switch
+
+The iOS Settings screen includes a `CC Switch` section for the currently active
+Mac server. It lists Claude Code and Codex providers from the Mac's local
+`~/.cc-switch/cc-switch.db`, shows the active provider, displays base URL and
+API key presence, and can switch providers through AgentMonitorService.
+
+Switching follows the same local state used by `ccs-claude-switch` and
+`ccs-codex-switch`: the service updates `~/.cc-switch/settings.json`, updates
+the active provider rows in SQLite, and restarts `/Applications/CC Switch.app`
+so the local proxy picks up the change. Provider API key values are never sent
+to iOS; the UI only receives whether a key is configured.
+
 ## iOS App Store Configuration
 
 `AgentMonitoriOS` is currently an iPhone-only app. Keep the App Store-facing settings in `project.yml`, then regenerate the Xcode project with `xcodegen generate`; direct edits to `AgentMonitorApple.xcodeproj` are generated artifacts and can be overwritten.
@@ -187,5 +200,6 @@ Each wrapper maps the current directory to a stable tmux session name. Running `
 
 - The macOS app binds `0.0.0.0:8787` and prefers a detected Tailscale IPv4 address for phone access.
 - The iOS app defaults to an empty service URL. Configure one or more Mac service URLs in Settings.
+- CC Switch controls operate on the active server profile and require the target Mac to have CC Switch state under `~/.cc-switch`.
 - HTTP local networking is allowed because the intended deployment is LAN or Tailscale.
 - Public internet exposure should use authentication and TLS.

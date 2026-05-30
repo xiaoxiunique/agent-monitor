@@ -42,6 +42,7 @@ static PENDING_INTERPRETATIONS: LazyLock<Mutex<HashMap<String, ()>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PANE_LOG_REFRESH_BURST_IDS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static CC_SWITCH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static PANE_LOG_REFRESH_BURST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_REFRESH_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PANE_LOG_REFRESH_BURST_DELAYS_MS: &[u64] = &[0, 80, 180, 360, 700, 1200, 2200, 3800];
@@ -221,6 +222,63 @@ struct KillSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchRequest {
+    app_type: String,
+    provider_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcSwitchProviderRow {
+    id: String,
+    app_type: String,
+    name: String,
+    is_current: i64,
+    settings_config: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchProvider {
+    id: String,
+    app_type: String,
+    name: String,
+    is_current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    has_api_key: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchApp {
+    app_type: String,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_provider_id: Option<String>,
+    providers: Vec<CcSwitchProvider>,
+}
+
+struct ValidatedCcSwitchProvider {
+    normalized_config: String,
+}
+
+struct PreparedCcSwitchSettingsUpdate {
+    settings_path: PathBuf,
+    tmp_path: PathBuf,
+}
+
+struct CcSwitchDbRollbackState {
+    active_provider_ids: Vec<String>,
+    proxy_backup_config: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcSwitchProxyBackupRow {
+    original_config: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TerminalMessage {
     #[serde(rename = "type")]
     message_type: Option<String>,
@@ -262,6 +320,8 @@ async fn main() {
         .route("/api/upload-image", post(api_upload_image))
         .route("/api/key", post(api_key))
         .route("/api/session/kill", post(api_kill_session))
+        .route("/api/cc-switch", get(api_cc_switch_status))
+        .route("/api/cc-switch/switch", post(api_cc_switch_switch))
         .route("/ws", get(snapshot_ws))
         .route("/pane-log/ws", get(pane_log_ws))
         .route("/terminal/ws", get(terminal_ws))
@@ -529,6 +589,34 @@ fn upload_output_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("output")
         .join("mobile-uploads")
+}
+
+fn user_home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn cc_switch_db_path() -> PathBuf {
+    env::var_os("CC_SWITCH_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home_dir().join(".cc-switch").join("cc-switch.db"))
+}
+
+fn cc_switch_settings_path() -> PathBuf {
+    env::var_os("CC_SWITCH_SETTINGS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home_dir().join(".cc-switch").join("settings.json"))
+}
+
+fn cc_switch_app_path() -> String {
+    env::var("CC_SWITCH_APP_PATH").unwrap_or_else(|_| "/Applications/CC Switch.app".to_string())
+}
+
+fn cc_switch_skip_restart() -> bool {
+    env::var("CC_SWITCH_SKIP_RESTART")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .unwrap_or(false)
 }
 
 fn paste_text(pane_id: &str, text: &str) -> Result<(), String> {
@@ -2084,6 +2172,574 @@ fn send_key_parts(pane_id: &str, parts: &[&str]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+async fn api_cc_switch_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+
+    match tokio::task::spawn_blocking(load_cc_switch_status).await {
+        Ok(Ok(apps)) => json_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "apps": apps,
+            }),
+        ),
+        Ok(Err(error)) => json_response(
+            StatusCode::OK,
+            json!({
+                "ok": false,
+                "apps": [],
+                "error": error,
+            }),
+        ),
+        Err(error) => json_response(
+            StatusCode::OK,
+            json!({
+                "ok": false,
+                "apps": [],
+                "error": error.to_string(),
+            }),
+        ),
+    }
+}
+
+async fn api_cc_switch_switch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<CcSwitchRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+
+    let app_type = body.app_type.trim().to_ascii_lowercase();
+    if app_type != "claude" && app_type != "codex" {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false, "error": "appType must be claude or codex" }),
+        );
+    }
+
+    let provider_id = body.provider_id.trim().to_string();
+    if provider_id.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false, "error": "providerId is required" }),
+        );
+    }
+
+    let result = tokio::task::spawn_blocking(move || switch_cc_provider(&app_type, &provider_id)).await;
+    match result {
+        Ok(Ok(apps)) => json_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "apps": apps,
+            }),
+        ),
+        Ok(Err(error)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "apps": [],
+                "error": error,
+            }),
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "ok": false,
+                "apps": [],
+                "error": error.to_string(),
+            }),
+        ),
+    }
+}
+
+fn load_cc_switch_status() -> Result<Vec<CcSwitchApp>, String> {
+    let rows = load_cc_switch_provider_rows()?;
+    Ok(cc_switch_apps_from_rows(rows))
+}
+
+fn load_cc_switch_provider_rows() -> Result<Vec<CcSwitchProviderRow>, String> {
+    let db_path = cc_switch_db_path();
+    if !db_path.exists() {
+        return Err(format!("missing cc-switch db: {}", db_path.display()));
+    }
+
+    let sql = "select id, app_type, name, is_current, settings_config from providers where app_type in ('claude','codex') order by app_type, is_current desc, sort_index, name;";
+    let output = Command::new("/usr/bin/sqlite3")
+        .arg("-readonly")
+        .arg("-cmd")
+        .arg(".timeout 5000")
+        .arg("-json")
+        .arg(&db_path)
+        .arg(sql)
+        .output()
+        .map_err(|error| format!("failed to run sqlite3: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("sqlite3 exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    serde_json::from_slice::<Vec<CcSwitchProviderRow>>(&output.stdout)
+        .map_err(|error| format!("failed to parse cc-switch providers: {error}"))
+}
+
+fn cc_switch_apps_from_rows(rows: Vec<CcSwitchProviderRow>) -> Vec<CcSwitchApp> {
+    ["claude", "codex"]
+        .iter()
+        .map(|app_type| {
+            let providers = rows
+                .iter()
+                .filter(|row| row.app_type == *app_type)
+                .map(cc_switch_provider_from_row)
+                .collect::<Vec<_>>();
+            let active_provider_id = providers
+                .iter()
+                .find(|provider| provider.is_current)
+                .map(|provider| provider.id.clone());
+            CcSwitchApp {
+                app_type: (*app_type).to_string(),
+                title: cc_switch_app_title(app_type),
+                active_provider_id,
+                providers,
+            }
+        })
+        .collect()
+}
+
+fn cc_switch_provider_from_row(row: &CcSwitchProviderRow) -> CcSwitchProvider {
+    let config = parse_cc_switch_config(row).ok();
+    CcSwitchProvider {
+        id: row.id.clone(),
+        app_type: row.app_type.clone(),
+        name: row.name.clone(),
+        is_current: row.is_current != 0,
+        base_url: config
+            .as_ref()
+            .and_then(|value| cc_switch_base_url(&row.app_type, value)),
+        has_api_key: config
+            .as_ref()
+            .map(|value| cc_switch_has_api_key(&row.app_type, value))
+            .unwrap_or(false),
+    }
+}
+
+fn parse_cc_switch_config(row: &CcSwitchProviderRow) -> Result<serde_json::Value, String> {
+    if row.settings_config.trim().is_empty() {
+        return Err(format!(
+            "provider has empty settings_config: {} ({})",
+            row.name, row.id
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(&row.settings_config).map_err(|error| {
+        format!(
+            "provider has invalid settings_config JSON: {} ({}) - {error}",
+            row.name, row.id
+        )
+    })
+}
+
+fn cc_switch_base_url(app_type: &str, config: &serde_json::Value) -> Option<String> {
+    match app_type {
+        "claude" => config
+            .pointer("/env/ANTHROPIC_BASE_URL")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        "codex" => config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .and_then(extract_codex_base_url),
+        _ => None,
+    }
+}
+
+fn cc_switch_has_api_key(app_type: &str, config: &serde_json::Value) -> bool {
+    match app_type {
+        "claude" => config
+            .pointer("/env/ANTHROPIC_API_KEY")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+            || config
+                .pointer("/env/ANTHROPIC_AUTH_TOKEN")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        "codex" => config
+            .pointer("/auth/OPENAI_API_KEY")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn extract_codex_base_url(config: &str) -> Option<String> {
+    let marker = "base_url";
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with(marker) {
+            continue;
+        }
+        let (_, value) = trimmed.split_once('=')?;
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn cc_switch_app_title(app_type: &str) -> String {
+    match app_type {
+        "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        _ => app_type.to_string(),
+    }
+}
+
+fn switch_cc_provider(app_type: &str, provider_id: &str) -> Result<Vec<CcSwitchApp>, String> {
+    let _guard = CC_SWITCH_LOCK
+        .lock()
+        .map_err(|_| "cc-switch operation lock is poisoned".to_string())?;
+    let rows = load_cc_switch_provider_rows()?;
+    let target = rows
+        .iter()
+        .find(|row| row.app_type == app_type && row.id == provider_id)
+        .ok_or_else(|| format!("provider not found: {app_type}/{provider_id}"))?;
+    let validated = validate_cc_switch_provider_for_switch(target)?;
+    let rollback = capture_cc_switch_db_rollback_state(app_type, &rows)?;
+    let settings_update = prepare_cc_switch_settings_update(app_type, provider_id)?;
+
+    if let Err(error) =
+        update_cc_switch_db_for_provider(app_type, provider_id, &validated.normalized_config)
+    {
+        cleanup_cc_switch_settings_update(&settings_update);
+        return Err(error);
+    }
+    if let Err(error) = verify_cc_switch_db_active_provider(app_type, provider_id) {
+        let rollback_message = rollback_cc_switch_db(app_type, &rollback)
+            .map(|_| "cc-switch db rolled back".to_string())
+            .unwrap_or_else(|rollback_error| format!("cc-switch db rollback failed: {rollback_error}"));
+        cleanup_cc_switch_settings_update(&settings_update);
+        return Err(format!("{error}; {rollback_message}"));
+    }
+
+    if let Err(error) = commit_cc_switch_settings_update(&settings_update) {
+        let rollback_message = rollback_cc_switch_db(app_type, &rollback)
+            .map(|_| "cc-switch db rolled back".to_string())
+            .unwrap_or_else(|rollback_error| format!("cc-switch db rollback failed: {rollback_error}"));
+        cleanup_cc_switch_settings_update(&settings_update);
+        return Err(format!("{error}; {rollback_message}"));
+    }
+
+    restart_cc_switch_app()?;
+    load_cc_switch_status()
+}
+
+fn update_cc_switch_db_for_provider(
+    app_type: &str,
+    provider_id: &str,
+    normalized_config: &str,
+) -> Result<(), String> {
+    let db_path = cc_switch_db_path();
+    let escaped_app_type = escape_sql(app_type);
+    let escaped_provider_id = escape_sql(provider_id);
+    let escaped_config = escape_sql(normalized_config);
+    let sql = format!(
+        "PRAGMA busy_timeout = 5000;\
+         BEGIN IMMEDIATE;\
+         UPDATE providers SET is_current = CASE WHEN id = '{escaped_provider_id}' THEN 1 ELSE 0 END WHERE app_type = '{escaped_app_type}';\
+         INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at) VALUES ('{escaped_app_type}', '{escaped_config}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\
+         ON CONFLICT(app_type) DO UPDATE SET original_config = excluded.original_config, backed_up_at = excluded.backed_up_at;\
+         COMMIT;"
+    );
+    let output = Command::new("/usr/bin/sqlite3")
+        .arg(&db_path)
+        .arg(sql)
+        .output()
+        .map_err(|error| format!("failed to update cc-switch db: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("sqlite3 exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    Ok(())
+}
+
+fn verify_cc_switch_db_active_provider(app_type: &str, provider_id: &str) -> Result<(), String> {
+    let active_provider_ids = load_cc_switch_provider_rows()?
+        .into_iter()
+        .filter(|row| row.app_type == app_type && row.is_current != 0)
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+
+    if active_provider_ids.len() == 1 && active_provider_ids.first() == Some(&provider_id.to_string()) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "cc-switch db active provider mismatch for {app_type}: expected {provider_id}, got {}",
+        if active_provider_ids.is_empty() {
+            "none".to_string()
+        } else {
+            active_provider_ids.join(",")
+        }
+    ))
+}
+
+fn validate_cc_switch_provider_for_switch(
+    row: &CcSwitchProviderRow,
+) -> Result<ValidatedCcSwitchProvider, String> {
+    let config = parse_cc_switch_config(row)?;
+    let _ = cc_switch_base_url(&row.app_type, &config).ok_or_else(|| {
+        match row.app_type.as_str() {
+            "claude" => format!(
+                "provider missing ANTHROPIC_BASE_URL: {} ({})",
+                row.name, row.id
+            ),
+            "codex" => format!("provider missing base_url: {} ({})", row.name, row.id),
+            _ => format!("unsupported app type: {}", row.app_type),
+        }
+    })?;
+
+    Ok(ValidatedCcSwitchProvider {
+        normalized_config: config.to_string(),
+    })
+}
+
+fn prepare_cc_switch_settings_update(
+    app_type: &str,
+    provider_id: &str,
+) -> Result<PreparedCcSwitchSettingsUpdate, String> {
+    let settings_path = cc_switch_settings_path();
+    if !settings_path.exists() {
+        return Err(format!("missing cc-switch settings: {}", settings_path.display()));
+    }
+
+    let raw = fs::read_to_string(&settings_path)
+        .map_err(|error| format!("failed to read cc-switch settings: {error}"))?;
+    let mut settings = serde_json::from_str::<serde_json::Value>(&raw)
+        .map_err(|error| format!("failed to parse cc-switch settings: {error}"))?;
+    let Some(object) = settings.as_object_mut() else {
+        return Err("cc-switch settings must be a JSON object".to_string());
+    };
+
+    let key = match app_type {
+        "claude" => "currentProviderClaude",
+        "codex" => "currentProviderCodex",
+        _ => return Err(format!("unsupported app type: {app_type}")),
+    };
+    object.insert(
+        key.to_string(),
+        serde_json::Value::String(provider_id.to_string()),
+    );
+
+    let formatted = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("failed to encode cc-switch settings: {error}"))?;
+    let tmp_path = cc_switch_settings_tmp_path(&settings_path);
+    fs::write(&tmp_path, format!("{formatted}\n"))
+        .map_err(|error| format!("failed to write temp cc-switch settings: {error}"))?;
+
+    Ok(PreparedCcSwitchSettingsUpdate {
+        settings_path,
+        tmp_path,
+    })
+}
+
+fn commit_cc_switch_settings_update(update: &PreparedCcSwitchSettingsUpdate) -> Result<(), String> {
+    fs::rename(&update.tmp_path, &update.settings_path)
+        .map_err(|error| format!("failed to replace cc-switch settings: {error}"))
+}
+
+fn cleanup_cc_switch_settings_update(update: &PreparedCcSwitchSettingsUpdate) {
+    let _ = fs::remove_file(&update.tmp_path);
+}
+
+fn cc_switch_settings_tmp_path(settings_path: &std::path::Path) -> PathBuf {
+    let file_name = settings_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("settings.json");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    settings_path.with_file_name(format!(
+        ".{file_name}.agent-monitor-{}-{nonce}.tmp",
+        std::process::id()
+    ))
+}
+
+fn capture_cc_switch_db_rollback_state(
+    app_type: &str,
+    rows: &[CcSwitchProviderRow],
+) -> Result<CcSwitchDbRollbackState, String> {
+    let active_provider_ids = rows
+        .iter()
+        .filter(|row| row.app_type == app_type && row.is_current != 0)
+        .map(|row| row.id.clone())
+        .collect::<Vec<_>>();
+    let proxy_backup_config = load_cc_switch_proxy_backup(app_type)?;
+
+    Ok(CcSwitchDbRollbackState {
+        active_provider_ids,
+        proxy_backup_config,
+    })
+}
+
+fn load_cc_switch_proxy_backup(app_type: &str) -> Result<Option<String>, String> {
+    let db_path = cc_switch_db_path();
+    let escaped_app_type = escape_sql(app_type);
+    let sql = format!(
+        "select original_config from proxy_live_backup where app_type = '{escaped_app_type}' limit 1;"
+    );
+    let output = Command::new("/usr/bin/sqlite3")
+        .arg("-readonly")
+        .arg("-cmd")
+        .arg(".timeout 5000")
+        .arg("-json")
+        .arg(&db_path)
+        .arg(sql)
+        .output()
+        .map_err(|error| format!("failed to read cc-switch proxy backup: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("sqlite3 exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    let rows = serde_json::from_slice::<Vec<CcSwitchProxyBackupRow>>(&output.stdout)
+        .map_err(|error| format!("failed to parse cc-switch proxy backup: {error}"))?;
+    Ok(rows.first().map(|row| row.original_config.clone()))
+}
+
+fn rollback_cc_switch_db(
+    app_type: &str,
+    rollback: &CcSwitchDbRollbackState,
+) -> Result<(), String> {
+    let db_path = cc_switch_db_path();
+    let escaped_app_type = escape_sql(app_type);
+    let active_sql = if rollback.active_provider_ids.is_empty() {
+        format!("UPDATE providers SET is_current = 0 WHERE app_type = '{escaped_app_type}';")
+    } else {
+        let ids = rollback
+            .active_provider_ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql(id)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "UPDATE providers SET is_current = CASE WHEN id IN ({ids}) THEN 1 ELSE 0 END WHERE app_type = '{escaped_app_type}';"
+        )
+    };
+    let backup_sql = if let Some(config) = &rollback.proxy_backup_config {
+        let escaped_config = escape_sql(config);
+        format!(
+            "INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at) VALUES ('{escaped_app_type}', '{escaped_config}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\
+             ON CONFLICT(app_type) DO UPDATE SET original_config = excluded.original_config, backed_up_at = excluded.backed_up_at;"
+        )
+    } else {
+        format!("DELETE FROM proxy_live_backup WHERE app_type = '{escaped_app_type}';")
+    };
+    let sql = format!("PRAGMA busy_timeout = 5000;BEGIN IMMEDIATE;{active_sql}{backup_sql}COMMIT;");
+    let output = Command::new("/usr/bin/sqlite3")
+        .arg(&db_path)
+        .arg(sql)
+        .output()
+        .map_err(|error| format!("failed to rollback cc-switch db: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("sqlite3 exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    Ok(())
+}
+
+fn restart_cc_switch_app() -> Result<(), String> {
+    if cc_switch_skip_restart() {
+        return Ok(());
+    }
+
+    let _ = Command::new("/usr/bin/osascript")
+        .args(["-e", "tell application \"CC Switch\" to quit"])
+        .output();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while cc_switch_process_is_running() {
+        if Instant::now() >= deadline {
+            return Err("CC Switch did not exit in time".to_string());
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    let app_path = cc_switch_app_path();
+    let status = Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(&app_path)
+        .status()
+        .map_err(|error| format!("failed to open CC Switch: {error}"))?;
+    if !status.success() {
+        return Err(format!("open exited with {status}"));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if cc_switch_process_is_running() && cc_switch_proxy_is_listening() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    Err("CC Switch restarted, but proxy port 15721 did not become ready in time".to_string())
+}
+
+fn cc_switch_process_is_running() -> bool {
+    Command::new("/usr/bin/pgrep")
+        .args(["-x", "cc-switch"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn cc_switch_proxy_is_listening() -> bool {
+    Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-iTCP:15721", "-sTCP:LISTEN"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn escape_sql(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 async fn api_kill_session(
