@@ -45,7 +45,10 @@ struct SwiftTermView: UIViewRepresentable {
     let service: TerminalWebSocketService
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(service: service)
+        Coordinator(
+            service: service,
+            bypassReadinessGateForUITest: ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_SCROLL_UITEST")
+        )
     }
 
     @MainActor
@@ -130,9 +133,11 @@ struct SwiftTermView: UIViewRepresentable {
         private var inertiaVelocityLinesPerSecond: CGFloat = 0
         private var inertiaRemainder: CGFloat = 0
         private var lastInertiaTimestamp: CFTimeInterval = 0
+        private let bypassReadinessGateForUITest: Bool
 
-        init(service: TerminalWebSocketService) {
+        init(service: TerminalWebSocketService, bypassReadinessGateForUITest: Bool) {
             self.service = service
+            self.bypassReadinessGateForUITest = bypassReadinessGateForUITest
         }
 
         deinit {
@@ -175,6 +180,15 @@ struct SwiftTermView: UIViewRepresentable {
             guard let terminalView = terminalView else { return }
             let translation = gesture.translation(in: terminalView)
             gesture.setTranslation(.zero, in: terminalView)
+
+            guard isReadyForTerminalScroll else {
+                stopInertia()
+                pendingScrollDelta = 0
+                isTerminalScrollGestureActive = false
+                hasReportedScrollForCurrentGesture = false
+                updateScrollAccessibilityValue("waiting")
+                return
+            }
 
             switch gesture.state {
             case .began:
@@ -293,6 +307,14 @@ struct SwiftTermView: UIViewRepresentable {
         private func sendScroll(lines: Int) {
             let svc = service
             MainActor.assumeIsolated { svc.sendScroll(lines: lines) }
+        }
+
+        @MainActor
+        private var isReadyForTerminalScroll: Bool {
+            if bypassReadinessGateForUITest {
+                return true
+            }
+            return service.isReadyForInteraction
         }
 
         @MainActor

@@ -19,6 +19,7 @@ final class TerminalWebSocketService {
     }
 
     private(set) var state: State = .disconnected
+    var isReadyForInteraction: Bool { state == .connected }
 
     var onData: ((String) -> Void)?
     var onStateChange: ((State) -> Void)?
@@ -88,20 +89,20 @@ final class TerminalWebSocketService {
     }
 
     func sendInput(_ text: String) {
-        guard let wsTask, state == .connected || state == .connecting else { return }
+        guard let wsTask, isReadyForInteraction else { return }
         let msg = "{\"type\":\"input\",\"data\":\(jsonEscape(text))}"
         wsTask.send(.string(msg)) { _ in }
     }
 
     func sendResize(cols: Int, rows: Int) {
         updateStoredTerminalSize(cols: cols, rows: rows)
-        guard let wsTask, state == .connected || state == .connecting else { return }
+        guard let wsTask, isReadyForInteraction else { return }
         let msg = "{\"type\":\"resize\",\"cols\":\(cols),\"rows\":\(rows)}"
         wsTask.send(.string(msg)) { _ in }
     }
 
     func sendScroll(lines: Int) {
-        guard let wsTask, state == .connected || state == .connecting else { return }
+        guard let wsTask, isReadyForInteraction else { return }
         let safeLines = max(-200, min(200, lines))
         guard safeLines != 0 else { return }
         let msg = "{\"type\":\"scroll\",\"lines\":\(safeLines)}"
@@ -171,13 +172,12 @@ final class TerminalWebSocketService {
                 }
 
                 switch server.type {
+                case "ready":
+                    markTaskConnected(task)
                 case "data":
                     if let payload = server.data {
                         guard wsTask === task else { return }
-                        if state != .connected {
-                            state = .connected
-                            onStateChange?(.connected)
-                        }
+                        markTaskConnected(task)
                         onData?(payload)
                     }
                 case "exit":
@@ -195,6 +195,14 @@ final class TerminalWebSocketService {
                 }
                 return
             }
+        }
+    }
+
+    private func markTaskConnected(_ task: URLSessionWebSocketTask) {
+        guard wsTask === task else { return }
+        if state != .connected {
+            state = .connected
+            onStateChange?(.connected)
         }
     }
 

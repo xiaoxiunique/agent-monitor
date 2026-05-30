@@ -2409,6 +2409,15 @@ async fn handle_terminal_socket(mut socket: WebSocket, query: HashMap<String, St
         }
     });
 
+    if socket
+        .send(Message::Text(json!({ "type": "ready" }).to_string().into()))
+        .await
+        .is_err()
+    {
+        let _ = child.kill();
+        return;
+    }
+
     loop {
         tokio::select! {
             event = event_rx.recv() => {
