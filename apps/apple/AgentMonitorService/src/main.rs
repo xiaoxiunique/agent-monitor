@@ -42,14 +42,11 @@ static PENDING_INTERPRETATIONS: LazyLock<Mutex<HashMap<String, ()>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PANE_LOG_REFRESH_BURST_IDS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static SCROLL_COPY_MODE_ACTIVITY: LazyLock<Mutex<HashMap<String, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 static PANE_LOG_REFRESH_BURST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SNAPSHOT_REFRESH_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PANE_LOG_REFRESH_BURST_DELAYS_MS: &[u64] = &[0, 80, 180, 360, 700, 1200, 2200, 3800];
 const PANE_COMMAND_TAIL_SETTLE_DELAYS_MS: &[u64] = &[0, 80, 180, 360, 700];
 const PANE_COMMAND_TAIL_LINE_COUNT: usize = 800;
-const SCROLL_COPY_MODE_CACHE_TTL: Duration = Duration::from_secs(2);
 
 struct PaneActivity {
     tail_hash: u64,
@@ -323,30 +320,17 @@ fn scroll_tmux_pane(pane_id: &str, lines: i32) {
         return;
     }
 
-    let recently_in_copy_mode = SCROLL_COPY_MODE_ACTIVITY
-        .lock()
-        .map(|activity| {
-            activity
-                .get(pane_id)
-                .map(|last_seen| last_seen.elapsed() < SCROLL_COPY_MODE_CACHE_TTL)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    let is_in_mode = recently_in_copy_mode
-        || run_tmux(&[
-            "display-message".to_string(),
-            "-p".to_string(),
-            "-t".to_string(),
-            pane_id.to_string(),
-            "#{pane_in_mode}".to_string(),
-        ])
-        .map(|output| output.stdout.trim() == "1")
-        .unwrap_or(false);
+    let is_in_mode = run_tmux(&[
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        pane_id.to_string(),
+        "#{pane_in_mode}".to_string(),
+    ])
+    .map(|output| output.stdout.trim() == "1")
+    .unwrap_or(false);
     if !is_in_mode {
         let _ = run_tmux(&["copy-mode".to_string(), "-t".to_string(), pane_id.to_string()]);
-    }
-    if let Ok(mut activity) = SCROLL_COPY_MODE_ACTIVITY.lock() {
-        activity.insert(pane_id.to_string(), Instant::now());
     }
     let direction = if safe_lines > 0 {
         "scroll-up"
@@ -367,9 +351,6 @@ fn scroll_tmux_pane(pane_id: &str, lines: i32) {
 fn exit_tmux_copy_mode(pane_id: &str) {
     if pane_id.is_empty() {
         return;
-    }
-    if let Ok(mut activity) = SCROLL_COPY_MODE_ACTIVITY.lock() {
-        activity.remove(pane_id);
     }
     let _ = run_tmux(&[
         "send-keys".to_string(),

@@ -130,9 +130,6 @@ struct SwiftTermView: UIViewRepresentable {
         private var inertiaVelocityLinesPerSecond: CGFloat = 0
         private var inertiaRemainder: CGFloat = 0
         private var lastInertiaTimestamp: CFTimeInterval = 0
-        private let scrollSensitivity: CGFloat = 1.12
-        private let scrollFlushDelay: TimeInterval = 0.012
-        private let maxScrollChunk = 120
 
         init(service: TerminalWebSocketService) {
             self.service = service
@@ -189,7 +186,7 @@ struct SwiftTermView: UIViewRepresentable {
             case .changed:
                 isTerminalScrollGestureActive = true
                 let cellHeight = max(terminalView.caretFrame.height, 12)
-                pendingScrollDelta += (translation.y / cellHeight) * scrollSensitivity
+                pendingScrollDelta += translation.y / cellHeight
                 let wholeLines = Int(pendingScrollDelta)
                 guard wholeLines != 0 else { return }
                 pendingScrollDelta -= CGFloat(wholeLines)
@@ -225,14 +222,14 @@ struct SwiftTermView: UIViewRepresentable {
                 self?.flushQueuedScroll()
             }
             scrollFlushWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + scrollFlushDelay, execute: workItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: workItem)
         }
 
         private func flushQueuedScroll() {
             scrollFlushWorkItem = nil
             guard queuedScrollLines != 0 else { return }
 
-            let chunk = max(-maxScrollChunk, min(maxScrollChunk, queuedScrollLines))
+            let chunk = max(-80, min(80, queuedScrollLines))
             queuedScrollLines -= chunk
             sendScroll(lines: chunk)
 
@@ -241,14 +238,14 @@ struct SwiftTermView: UIViewRepresentable {
                     self?.flushQueuedScroll()
                 }
                 scrollFlushWorkItem = workItem
-                DispatchQueue.main.asyncAfter(deadline: .now() + scrollFlushDelay, execute: workItem)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: workItem)
             }
         }
 
         private func startInertia(velocityLinesPerSecond: CGFloat) {
             stopInertia()
-            let clampedVelocity = max(-1200, min(1200, velocityLinesPerSecond * scrollSensitivity))
-            guard abs(clampedVelocity) >= 14 else {
+            let clampedVelocity = max(-900, min(900, velocityLinesPerSecond))
+            guard abs(clampedVelocity) >= 18 else {
                 flushQueuedScroll()
                 return
             }
@@ -278,8 +275,8 @@ struct SwiftTermView: UIViewRepresentable {
                 queueScroll(lines: wholeLines)
             }
 
-            inertiaVelocityLinesPerSecond *= pow(0.92, CGFloat(elapsed) * 60)
-            if abs(inertiaVelocityLinesPerSecond) < 5 {
+            inertiaVelocityLinesPerSecond *= pow(0.88, CGFloat(elapsed) * 60)
+            if abs(inertiaVelocityLinesPerSecond) < 8 {
                 stopInertia()
                 flushQueuedScroll()
             }
