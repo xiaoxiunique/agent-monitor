@@ -151,10 +151,16 @@ struct AgentEventsResponse: Codable, Equatable {
     let error: String?
 }
 
+struct SystemStats: Codable, Equatable {
+    let cpuUsage: Double?
+    let memoryUsage: Double?
+}
+
 struct Snapshot: Codable, Equatable {
     let ok: Bool
     let now: Date
     let panes: [Pane]
+    let system: SystemStats?
     let error: String?
 }
 

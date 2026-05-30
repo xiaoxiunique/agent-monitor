@@ -161,10 +161,19 @@ struct Pane {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SystemStats {
+    cpu_usage: Option<f64>,
+    memory_usage: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct Snapshot {
     ok: bool,
     now: String,
     panes: Vec<Pane>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<SystemStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -1542,6 +1551,7 @@ fn track_pane_activity(pane_id: &str, tail: &str) -> bool {
 
 fn build_snapshot() -> Snapshot {
     let now = now_iso();
+    let system = collect_system_stats();
     let panes = match list_panes() {
         Ok(panes) => panes,
         Err(error) => {
@@ -1549,6 +1559,7 @@ fn build_snapshot() -> Snapshot {
                 ok: false,
                 now,
                 panes: Vec::new(),
+                system,
                 error: Some(error),
             };
         }
@@ -1587,8 +1598,96 @@ fn build_snapshot() -> Snapshot {
         ok: true,
         now,
         panes,
+        system,
         error: None,
     }
+}
+
+fn collect_system_stats() -> Option<SystemStats> {
+    let cpu_usage = collect_cpu_usage();
+    let memory_usage = collect_memory_usage();
+    if cpu_usage.is_none() && memory_usage.is_none() {
+        return None;
+    }
+    Some(SystemStats {
+        cpu_usage,
+        memory_usage,
+    })
+}
+
+fn collect_cpu_usage() -> Option<f64> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "%cpu="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let total: f64 = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .sum();
+    let cores = command_stdout("sysctl", &["-n", "hw.logicalcpu"])
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(1.0);
+    Some((total / cores).clamp(0.0, 100.0))
+}
+
+fn collect_memory_usage() -> Option<f64> {
+    let total_bytes = command_stdout("sysctl", &["-n", "hw.memsize"])?
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    let vm_stat = command_stdout("vm_stat", &[])?;
+    let mut page_size = 4096.0;
+    let mut free_pages = 0.0;
+    let mut inactive_pages = 0.0;
+    let mut speculative_pages = 0.0;
+
+    for line in vm_stat.lines() {
+        if let Some(size) = line
+            .split("page size of ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|value| value.parse::<f64>().ok())
+        {
+            page_size = size;
+            continue;
+        }
+
+        let pages = parse_vm_stat_pages(line);
+        if line.starts_with("Pages free:") {
+            free_pages = pages?;
+        } else if line.starts_with("Pages inactive:") {
+            inactive_pages = pages?;
+        } else if line.starts_with("Pages speculative:") {
+            speculative_pages = pages?;
+        }
+    }
+
+    let available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
+    let used_ratio = ((total_bytes - available_bytes).max(0.0) / total_bytes).clamp(0.0, 1.0);
+    Some(used_ratio * 100.0)
+}
+
+fn parse_vm_stat_pages(line: &str) -> Option<f64> {
+    line.split(':')
+        .nth(1)?
+        .trim()
+        .trim_end_matches('.')
+        .replace(',', "")
+        .parse::<f64>()
+        .ok()
+}
+
+fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn broadcast_snapshot(state: &AppState) -> Snapshot {
@@ -1766,10 +1865,7 @@ async fn api_send(
     }
 
     if body.text.len() > 4000 {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "text is too long" }),
-        );
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "text is too long" }));
     }
 
     let requested_submit_key = match body.submit_key.as_deref() {
@@ -1833,7 +1929,10 @@ async fn api_refine_text(
     }
 
     if body.text.len() > 4000 {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "text is too long" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "text is too long" }),
+        );
     }
 
     let original = body.text;

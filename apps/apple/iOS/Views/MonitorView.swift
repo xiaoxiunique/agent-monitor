@@ -156,6 +156,8 @@ private struct ServerWorkSessionsView: View {
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
+                            machineStatusStrip
+
                             if let connectionBannerText {
                                 connectionBanner(text: connectionBannerText)
                             }
@@ -203,26 +205,13 @@ private struct ServerWorkSessionsView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                ConnectionStatusBadge(
-                    state: state.connectionState,
-                    errorMessage: state.errorMessage,
-                    serverName: profile.displayName,
-                    serverURL: profile.url,
-                    isLoading: state.isLoading,
-                    onOpenSettings: { showingSettings = true }
-                )
-
-                if !isActiveServer {
-                    Button {
-                        selectServer(profile)
-                    } label: {
-                        Label("Use", systemImage: "checkmark.circle")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .accessibilityLabel("Set active server")
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 16, weight: .semibold))
                 }
+                .accessibilityLabel("Configure \(profile.displayName)")
             }
         }
         .sheet(isPresented: $showingSettings) {
@@ -293,6 +282,31 @@ private struct ServerWorkSessionsView: View {
             return "Connection unavailable. Showing last snapshot from \(StableTimeFormatter.shortDateTime(lastSeenAt))."
         }
         return "Connection unavailable. Showing the last available snapshot."
+    }
+
+    private var machineStatusStrip: some View {
+        HStack(spacing: 10) {
+            ResourceMetricPill(title: "CPU", value: state.snapshot?.system?.cpuUsage)
+            ResourceMetricPill(title: "MEM", value: state.snapshot?.system?.memoryUsage)
+
+            Spacer(minLength: 8)
+
+            ConnectionDot(
+                state: state.connectionState,
+                errorMessage: state.errorMessage,
+                serverURL: profile.url,
+                isLoading: state.isLoading
+            )
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(AgentMonitorTheme.surface(for: colorScheme), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
+        )
+        .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 10 : 7, x: 0, y: 3)
+        .accessibilityElement(children: .combine)
     }
 
     private func connectionBanner(text: String) -> some View {
@@ -663,6 +677,82 @@ private struct PaneDetailRoute: View {
 }
 
 // MARK: - Connection Status
+
+private struct ResourceMetricPill: View {
+    let title: String
+    let value: Double?
+
+    private var displayValue: String {
+        guard let value else { return "--" }
+        return "\(Int(value.rounded()))%"
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+            Text(displayValue)
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .foregroundColor(.primary.opacity(0.86))
+        }
+        .lineLimit(1)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemFill), in: Capsule())
+        .accessibilityLabel("\(title) \(displayValue)")
+    }
+}
+
+private struct ConnectionDot: View {
+    let state: String
+    let errorMessage: String?
+    let serverURL: String
+    let isLoading: Bool
+
+    private var trimmedURL: String {
+        serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isLive: Bool {
+        !trimmedURL.isEmpty && (state == "live" || state == "reconnecting")
+    }
+
+    private var isChecking: Bool {
+        !trimmedURL.isEmpty && !isLive && errorMessage == nil && (state == "connecting" || state == "unknown")
+    }
+
+    private var tint: Color {
+        isLive ? .green : .red
+    }
+
+    private var title: String {
+        if isLive { return "Live" }
+        if isChecking { return "Checking" }
+        return "Offline"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(tint)
+                .frame(width: 8, height: 8)
+                .symbolEffect(.pulse, options: .repeating, value: isChecking && isLoading)
+
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(tint)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(tint.opacity(0.10), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(tint.opacity(0.18), lineWidth: 1)
+        )
+        .accessibilityLabel("Connection \(title)")
+    }
+}
 
 private struct ConnectionStatusBadge: View {
     @Environment(\.colorScheme) private var colorScheme
