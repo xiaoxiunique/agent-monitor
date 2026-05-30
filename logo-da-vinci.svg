@@ -1,0 +1,51 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Monitor Da Vinci Style Logo</title>
+  <desc id="desc">A minimal sepia line logo combining Vitruvian construction geometry, an eye, and a terminal prompt.</desc>
+  <defs>
+    <radialGradient id="paper" cx="50%" cy="42%" r="72%">
+      <stop offset="0%" stop-color="#FBF6E8"/>
+      <stop offset="100%" stop-color="#E8D9B8"/>
+    </radialGradient>
+    <style>
+      .paper { fill: url(#paper); }
+      .construct { stroke: #8A6B3E; stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; opacity: .34; }
+      .ink { stroke: #3F3020; stroke-width: 24; stroke-linecap: round; stroke-linejoin: round; }
+      .ink-thin { stroke: #3F3020; stroke-width: 14; stroke-linecap: round; stroke-linejoin: round; }
+      .accent { stroke: #557158; stroke-width: 22; stroke-linecap: round; stroke-linejoin: round; }
+      .fill-ink { fill: #3F3020; }
+      .fill-accent { fill: #557158; }
+    </style>
+  </defs>
+
+  <rect class="paper" width="1024" height="1024" rx="156"/>
+
+  <g aria-hidden="true">
+    <rect class="construct" x="154" y="154" width="716" height="716" rx="22"/>
+    <circle class="construct" cx="512" cy="512" r="364"/>
+    <circle class="construct" cx="512" cy="512" r="254"/>
+    <path class="construct" d="M512 148V876"/>
+    <path class="construct" d="M148 512H876"/>
+    <path class="construct" d="M255 255L769 769"/>
+    <path class="construct" d="M769 255L255 769"/>
+    <path class="construct" d="M512 148L646 512L512 876L378 512Z"/>
+    <path class="construct" d="M154 154L512 512L870 154"/>
+    <path class="construct" d="M154 870L512 512L870 870"/>
+  </g>
+
+  <g>
+    <path class="ink" d="M278 512C333 418 425 368 512 368C599 368 691 418 746 512C691 606 599 656 512 656C425 656 333 606 278 512Z"/>
+    <circle cx="512" cy="512" r="84" fill="#F4E8CE" stroke="#3F3020" stroke-width="20"/>
+    <path class="accent" d="M472 480L518 512L472 544"/>
+    <path class="accent" d="M542 544H596"/>
+    <circle class="fill-ink" cx="512" cy="512" r="13"/>
+  </g>
+
+  <g aria-hidden="true">
+    <path class="ink-thin" d="M338 722C390 760 450 780 512 780C574 780 634 760 686 722"/>
+    <path class="ink-thin" d="M338 302C390 264 450 244 512 244C574 244 634 264 686 302"/>
+    <circle class="fill-accent" cx="512" cy="156" r="11"/>
+    <circle class="fill-accent" cx="512" cy="868" r="11"/>
+    <circle class="fill-accent" cx="156" cy="512" r="11"/>
+    <circle class="fill-accent" cx="868" cy="512" r="11"/>
+  </g>
+</svg>
