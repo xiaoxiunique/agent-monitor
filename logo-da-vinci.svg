@@ -8,9 +8,9 @@
     </radialGradient>
     <style>
       .paper { fill: url(#paper); }
-      .construct { stroke: #8A6B3E; stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; opacity: .34; }
-      .ink { stroke: #3F3020; stroke-width: 24; stroke-linecap: round; stroke-linejoin: round; }
-      .ink-thin { stroke: #3F3020; stroke-width: 14; stroke-linecap: round; stroke-linejoin: round; }
+      .construct { stroke: #8A6B3E; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; opacity: .22; }
+      .ink { stroke: #3F3020; stroke-width: 22; stroke-linecap: round; stroke-linejoin: round; }
+      .ink-thin { stroke: #3F3020; stroke-width: 11; stroke-linecap: round; stroke-linejoin: round; opacity: .82; }
       .accent { stroke: #557158; stroke-width: 22; stroke-linecap: round; stroke-linejoin: round; }
       .fill-ink { fill: #3F3020; }
       .fill-accent { fill: #557158; }
@@ -20,16 +20,10 @@
   <rect class="paper" width="1024" height="1024" rx="156"/>
 
   <g aria-hidden="true">
-    <rect class="construct" x="154" y="154" width="716" height="716" rx="22"/>
-    <circle class="construct" cx="512" cy="512" r="364"/>
-    <circle class="construct" cx="512" cy="512" r="254"/>
-    <path class="construct" d="M512 148V876"/>
-    <path class="construct" d="M148 512H876"/>
-    <path class="construct" d="M255 255L769 769"/>
-    <path class="construct" d="M769 255L255 769"/>
-    <path class="construct" d="M512 148L646 512L512 876L378 512Z"/>
-    <path class="construct" d="M154 154L512 512L870 154"/>
-    <path class="construct" d="M154 870L512 512L870 870"/>
+    <rect class="construct" x="174" y="174" width="676" height="676" rx="22"/>
+    <circle class="construct" cx="512" cy="512" r="338"/>
+    <path class="construct" d="M512 176V848"/>
+    <path class="construct" d="M176 512H848"/>
   </g>
 
   <g>
@@ -41,8 +35,8 @@
   </g>
 
   <g aria-hidden="true">
-    <path class="ink-thin" d="M338 722C390 760 450 780 512 780C574 780 634 760 686 722"/>
-    <path class="ink-thin" d="M338 302C390 264 450 244 512 244C574 244 634 264 686 302"/>
+    <path class="ink-thin" d="M364 730C409 758 459 772 512 772C565 772 615 758 660 730"/>
+    <path class="ink-thin" d="M364 294C409 266 459 252 512 252C565 252 615 266 660 294"/>
     <circle class="fill-accent" cx="512" cy="156" r="11"/>
     <circle class="fill-accent" cx="512" cy="868" r="11"/>
     <circle class="fill-accent" cx="156" cy="512" r="11"/>
