@@ -26,7 +26,7 @@ DRY_RUN=0
 
 usage() {
   cat <<'EOF'
-Usage: npm run tf -- [options]
+Usage: apps/apple/scripts/upload-testflight.sh [options]
 
 Builds AgentMonitoriOS, uploads it to TestFlight, and waits for App Store
 Connect to mark the delivery VALID.
@@ -34,7 +34,7 @@ Connect to mark the delivery VALID.
 Options:
   --build-number N   Use an explicit iOS build number instead of current + 1.
   --no-increment     Reuse the build number currently in apps/apple/project.yml.
-  --skip-checks      Skip npm run check and npm run check:rust.
+  --skip-checks      Skip Rust service checks.
   --no-wait          Do not wait for App Store Connect build status.
   --dry-run          Print the resolved release settings without changing files.
   -h, --help         Show this help.
@@ -149,6 +149,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_cmd ruby
+require_cmd cargo
 require_cmd xcodegen
 require_cmd pod
 require_cmd xcodebuild
@@ -206,8 +207,7 @@ fi
 
 if [[ "$RUN_CHECKS" == "1" ]]; then
   log "Running repository checks"
-  (cd "$MONOREPO_DIR" && npm run check)
-  (cd "$MONOREPO_DIR" && npm run check:rust)
+  cargo check --manifest-path "$ROOT_DIR/AgentMonitorService/Cargo.toml"
 fi
 
 log "Generating Xcode project and installing pods"

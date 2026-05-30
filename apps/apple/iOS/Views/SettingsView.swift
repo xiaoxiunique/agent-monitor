@@ -3,7 +3,6 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(MonitorStore.self) private var store
-    @Environment(BackgroundAudioKeepAlive.self) private var backgroundAudio
     @Environment(\.colorScheme) private var colorScheme
     @State private var testState: TestState = .idle
     @State private var voiceTestState: TestState = .idle
@@ -78,14 +77,6 @@ struct SettingsView: View {
                     }
 
                     Toggle("Keep Screen Awake", isOn: $settings.keepScreenAwake)
-
-                    Toggle("Background Audio Keep Alive", isOn: backgroundAudioBinding)
-
-                    if let message = backgroundAudio.lastErrorMessage {
-                        Text("Background audio failed: \(message)")
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
                 }
 
                 Section {
@@ -270,22 +261,6 @@ struct SettingsView: View {
         guard settings.quickActionButtons.indices.contains(index) else { return }
         settings.quickActionButtons.remove(at: index)
     }
-
-    private var backgroundAudioBinding: Binding<Bool> {
-        Binding {
-            settings.backgroundAudioKeepAlive
-        } set: { enabled in
-            guard backgroundAudio.setEnabled(enabled) else {
-                settings.backgroundAudioKeepAlive = false
-                Haptics.sent(success: false)
-                return
-            }
-
-            settings.backgroundAudioKeepAlive = enabled
-            Haptics.sent(success: true)
-        }
-    }
-
     private func testConnection() async {
         guard let client = store.makeClient() else {
             testState = .failed("Invalid URL")

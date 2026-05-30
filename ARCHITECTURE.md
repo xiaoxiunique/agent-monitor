@@ -4,8 +4,8 @@ Agent Monitor is a local-first control surface for agent processes running in tm
 
 ## Components
 
-- `src/server.ts`: Node.js reference service. It serves the HTTP API, WebSocket streams, and tmux control commands.
-- `scripts/`: macOS LaunchAgent helpers for running the Node service at login.
+- `apps/apple/AgentMonitorService`: Rust service that serves the HTTP API, WebSocket streams, and tmux control commands.
+- `scripts/`: macOS LaunchAgent helpers for running the Rust service at login.
 - `apps/apple`: combined XcodeGen project for the macOS menu bar app, iOS companion app, and packaged Rust service.
 
 ## Data Flow
@@ -36,8 +36,8 @@ The default mode is designed for trusted LAN or Tailscale networks. Token auth i
 - `AgentMonitorMac`: packages the Rust backend for a resident macOS menu bar app.
 - `AgentMonitoriOS`: native SwiftUI phone client that talks to the same HTTP/WebSocket API.
 
-The Rust backend lives in `apps/apple/AgentMonitorService`. It implements the same API as the Node reference service so the iOS client can use either runtime.
+The Rust backend is the only supported service runtime. The iOS client and macOS companion both talk to its HTTP/WebSocket API.
 
 `AgentMonitoriOS` is intentionally configured as an iPhone-only App Store target today. The generated build settings set `TARGETED_DEVICE_FAMILY = 1`, and the shipped `Info.plist` declares portrait orientation only. This avoids App Store Connect's iPad multitasking orientation requirement until the iPad layout is explicitly supported.
 
-The iOS target also includes SwiftTerm for the native terminal view, an asset catalog for AppIcon and launch background color, local-network ATS allowances for LAN/Tailscale HTTP access, microphone privacy descriptions for voice input, and the `audio` background mode for the optional background keep-alive behavior. Tencent Cloud real-time ASR is integrated through CocoaPods (`QCloudRealTime`), so iOS builds use `AgentMonitorApple.xcworkspace`. Apple Speech remains available as a fallback provider.
+The iOS target also includes SwiftTerm for the native terminal view, an asset catalog for AppIcon and launch background color, local-network ATS allowances for LAN/Tailscale HTTP access, and microphone privacy descriptions for voice input. Tencent Cloud real-time ASR is integrated through CocoaPods (`QCloudRealTime`), so iOS builds use `AgentMonitorApple.xcworkspace`. Apple Speech remains available as a fallback provider.

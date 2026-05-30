@@ -5,7 +5,6 @@ import SwiftUI
 struct MonitorView: View {
     @Environment(MonitorStore.self) private var store
     @Environment(AppSettings.self) private var settings
-    @Environment(BackgroundAudioKeepAlive.self) private var backgroundAudio
     @Environment(\.colorScheme) private var colorScheme
     @State private var showingSettings = false
 
@@ -24,9 +23,6 @@ struct MonitorView: View {
 
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
-                            fleetSummary
-                                .padding(.bottom, 2)
-
                             Text("Machines")
                                 .font(.system(size: 13, weight: .semibold))
                                 .foregroundColor(.secondary)
@@ -106,57 +102,15 @@ struct MonitorView: View {
                     .foregroundColor(.primary)
             }
             .disabled(store.isLoading)
-
-            Button {
-                toggleBackgroundKeepAlive()
-            } label: {
-                Image(systemName: settings.backgroundAudioKeepAlive ? "headphones.circle.fill" : "headphones.circle")
-                    .font(.system(size: 21))
-                    .foregroundColor(settings.backgroundAudioKeepAlive ? .accentColor : .primary)
-            }
-            .accessibilityLabel(settings.backgroundAudioKeepAlive ? "Disable background keep alive" : "Enable background keep alive")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-    }
-
-    private var fleetSummary: some View {
-        let states = serverProfiles.map { store.serverMonitorState(for: $0) }
-        let onlineCount = states.filter { $0.connectionState == "live" || $0.connectionState == "reconnecting" }.count
-        let waitingCount = states.reduce(0) { partial, state in
-            partial + (state.snapshot?.panes.filter { $0.status == .waiting }.count ?? 0)
-        }
-        let runningCount = states.reduce(0) { partial, state in
-            partial + (state.snapshot?.panes.filter { $0.status == .running }.count ?? 0)
-        }
-        let doneCount = states.reduce(0) { partial, state in
-            partial + (state.snapshot?.panes.filter { $0.status == .done }.count ?? 0)
-        }
-
-        return HStack(spacing: 8) {
-            FleetMetricTile(title: "Online", value: "\(onlineCount)/\(serverProfiles.count)", tint: .green)
-            FleetMetricTile(title: "Waiting", value: "\(waitingCount)", tint: .yellow)
-            FleetMetricTile(title: "Running", value: "\(runningCount)", tint: .green)
-            FleetMetricTile(title: "Done", value: "\(doneCount)", tint: .blue)
-        }
     }
 
     private func selectServer(_ profile: ServerProfile) {
         settings.selectServer(profile.id)
         Haptics.sent(success: true)
         store.start()
-    }
-
-    private func toggleBackgroundKeepAlive() {
-        let nextValue = !settings.backgroundAudioKeepAlive
-        guard backgroundAudio.setEnabled(nextValue) else {
-            settings.backgroundAudioKeepAlive = false
-            Haptics.sent(success: false)
-            return
-        }
-
-        settings.backgroundAudioKeepAlive = nextValue
-        Haptics.sent(success: true)
     }
 }
 
@@ -168,6 +122,8 @@ private struct ServerWorkSessionsView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var showingSettings = false
     @State private var selectedPaneRoute: PaneNavigationRoute?
+    @State private var expandedPaneRoute: PaneNavigationRoute?
+    @State private var selectedPaneDetent: PresentationDetent = PaneDetailSheetDetents.preview
 
     private var state: ServerMonitorState {
         store.serverMonitorState(for: profile)
@@ -181,32 +137,30 @@ private struct ServerWorkSessionsView: View {
         sortedWorkSessions(state.snapshot?.panes ?? [], pinned: settings.pinnedProjects)
     }
 
+    private var hasSnapshot: Bool {
+        state.snapshot != nil
+    }
+
+    private var hasConnectionProblem: Bool {
+        state.connectionState == "offline" || state.connectionState == "unconfigured" || state.errorMessage != nil
+    }
+
     var body: some View {
         ZStack {
             AgentMonitorTheme.backgroundGradient(for: colorScheme)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                if panes.isEmpty && !state.isLoading {
-                    VStack(spacing: 20) {
-                        Spacer()
-                        Image(systemName: "sparkles.rectangle.stack")
-                            .font(.system(size: 58))
-                            .foregroundColor(.secondary.opacity(colorScheme == .dark ? 0.5 : 0.45))
-                        Text("No active work")
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.secondary)
-                        Text(emptyStateDescription)
-                            .font(.system(size: 14))
-                            .foregroundColor(.secondary.opacity(0.82))
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 40)
-                        Spacer()
-                    }
+                if panes.isEmpty && (state.isLoading || state.connectionState == "connecting") {
+                    connectionCheckingState
+                } else if panes.isEmpty {
+                    connectionEmptyState
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
-                            WorkSessionStatusStrip(panes: panes)
+                            if let connectionBannerText {
+                                connectionBanner(text: connectionBannerText)
+                            }
 
                             ForEach(panes) { pane in
                                 let project = AppSettings.projectName(from: pane.session)
@@ -246,9 +200,6 @@ private struct ServerWorkSessionsView: View {
         }
         .navigationTitle(profile.displayName)
         .navigationBarTitleDisplayMode(.inline)
-        .navigationDestination(item: $selectedPaneRoute) { route in
-            PaneDetailRoute(route: route)
-        }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 ConnectionStatusBadge(
@@ -260,12 +211,17 @@ private struct ServerWorkSessionsView: View {
                     onOpenSettings: { showingSettings = true }
                 )
 
-                Button {
-                    selectServer(profile)
-                } label: {
-                    Image(systemName: isActiveServer ? "checkmark.circle.fill" : "checkmark.circle")
+                if !isActiveServer {
+                    Button {
+                        selectServer(profile)
+                    } label: {
+                        Label("Use", systemImage: "checkmark.circle")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel("Set active server")
                 }
-                .accessibilityLabel("Set active server")
             }
         }
         .sheet(isPresented: $showingSettings) {
@@ -273,6 +229,144 @@ private struct ServerWorkSessionsView: View {
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
+        .sheet(item: $selectedPaneRoute, onDismiss: {
+            selectedPaneDetent = PaneDetailSheetDetents.preview
+        }) { route in
+            NavigationStack {
+                PaneDetailRoute(
+                    route: route,
+                    showsInputBar: false,
+                    showsNavigationChrome: false,
+                    terminalHorizontalPadding: 0
+                )
+            }
+            .presentationDetents([PaneDetailSheetDetents.preview, .large], selection: $selectedPaneDetent)
+            .presentationDragIndicator(.visible)
+            .presentationBackground(.black)
+            .presentationCornerRadius(0)
+        }
+        .fullScreenCover(item: $expandedPaneRoute) { route in
+            NavigationStack {
+                PaneDetailRoute(
+                    route: route,
+                    showsInputBar: true,
+                    showsNavigationChrome: true,
+                    terminalHorizontalPadding: 0
+                )
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            expandedPaneRoute = nil
+                        } label: {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 18, weight: .semibold))
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Back")
+                    }
+                }
+            }
+            .interactiveDismissDisabled(true)
+        }
+        .onChange(of: selectedPaneDetent) { _, detent in
+            guard detent == .large, let route = selectedPaneRoute else { return }
+            expandedPaneRoute = route
+            selectedPaneRoute = nil
+            selectedPaneDetent = PaneDetailSheetDetents.preview
+        }
+    }
+
+    @ViewBuilder
+    private var connectionCheckingState: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            ProgressView()
+                .controlSize(.large)
+            Text("Checking connection")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(.primary.opacity(0.82))
+            Text("Connecting to \(profile.displayName). This should resolve within a few seconds.")
+                .font(.system(size: 14))
+                .foregroundColor(.secondary.opacity(0.86))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 38)
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private var connectionEmptyState: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image(systemName: emptyStateIcon)
+                .font(.system(size: 54))
+                .foregroundColor(emptyStateTint.opacity(colorScheme == .dark ? 0.72 : 0.64))
+            Text(emptyStateTitle)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(.primary.opacity(0.82))
+            Text(emptyStateDescription)
+                .font(.system(size: 14))
+                .foregroundColor(.secondary.opacity(0.86))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 38)
+
+            HStack(spacing: 10) {
+                Button {
+                    retryConnection()
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(state.isLoading)
+
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+                .buttonStyle(.bordered)
+            }
+            .font(.system(size: 13, weight: .semibold))
+            Spacer()
+        }
+    }
+
+    private var connectionBannerText: String? {
+        guard hasSnapshot, hasConnectionProblem else { return nil }
+        if let lastSeenAt = state.lastSeenAt {
+            return "Connection unavailable. Showing last snapshot from \(StableTimeFormatter.shortDateTime(lastSeenAt))."
+        }
+        return "Connection unavailable. Showing the last available snapshot."
+    }
+
+    private func connectionBanner(text: String) -> some View {
+        Label(text, systemImage: "wifi.slash")
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(.secondary)
+            .lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(AgentMonitorTheme.surface(for: colorScheme), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.red.opacity(0.18), lineWidth: 1)
+            )
+    }
+
+    private var emptyStateTitle: String {
+        if hasConnectionProblem { return "Connection unavailable" }
+        return "No active work"
+    }
+
+    private var emptyStateIcon: String {
+        if hasConnectionProblem { return "wifi.slash" }
+        return "sparkles.rectangle.stack"
+    }
+
+    private var emptyStateTint: Color {
+        hasConnectionProblem ? .red : .secondary
     }
 
     @ViewBuilder
@@ -299,6 +393,17 @@ private struct ServerWorkSessionsView: View {
         return "Connected to \(profile.displayName). Start a tmux session or check that this is the same machine."
     }
 
+    private func retryConnection() {
+        if isActiveServer {
+            Task {
+                await store.refresh()
+                await store.connectWebSocket()
+            }
+        } else {
+            Task { await store.refreshAllServerStates() }
+        }
+    }
+
     private func selectServer(_ profile: ServerProfile) {
         settings.selectServer(profile.id)
         Haptics.sent(success: true)
@@ -310,6 +415,7 @@ private struct ServerWorkSessionsView: View {
             settings.selectServer(profile.id)
             store.start()
         }
+        selectedPaneDetent = PaneDetailSheetDetents.preview
         let route = PaneNavigationRoute(
             pane: pane,
             serverIdentity: settings.activeServerIdentity,
@@ -318,6 +424,10 @@ private struct ServerWorkSessionsView: View {
         selectedPaneRoute = route
         Haptics.sent(success: true)
     }
+}
+
+private enum PaneDetailSheetDetents {
+    static let preview: PresentationDetent = .fraction(0.68)
 }
 
 private struct PaneNavigationRoute: Identifiable, Hashable {
@@ -375,33 +485,6 @@ private func workSessionPriority(_ pane: Pane) -> Int {
     case .running: 2
     case .done: 3
     case .idle: 4
-    }
-}
-
-private struct FleetMetricTile: View {
-    @Environment(\.colorScheme) private var colorScheme
-    let title: String
-    let value: String
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(value)
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundColor(.primary)
-            Text(title)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 11)
-        .padding(.vertical, 10)
-        .background(AgentMonitorTheme.surface(for: colorScheme))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(tint.opacity(0.18), lineWidth: 1)
-        )
     }
 }
 
@@ -464,59 +547,50 @@ private struct MachineCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
-            HStack(alignment: .top, spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(statusTint.opacity(0.13))
-                    Image(systemName: "desktopcomputer")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundColor(statusTint)
-                }
-                .frame(width: 44, height: 44)
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(statusTint.opacity(0.13))
+                Image(systemName: "desktopcomputer")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(statusTint)
+            }
+            .frame(width: 44, height: 44)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 7) {
-                        Text(profile.displayName)
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundColor(.primary)
-                            .lineLimit(1)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 7) {
+                    Text(profile.displayName)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
 
-                        if isActive {
-                            Text("Active")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(.accentColor)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.accentColor.opacity(0.12), in: Capsule())
-                        }
+                    if isActive {
+                        Text("Active")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.accentColor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.12), in: Capsule())
                     }
-
-                    Text(headline)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(statusTint)
-                        .lineLimit(1)
-
-                    Text(detail)
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
                 }
 
-                Spacer()
+                Text(headline)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(statusTint)
+                    .lineLimit(1)
 
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color(.tertiaryLabel))
-                    .padding(.top, 14)
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
             }
 
-            HStack(spacing: 7) {
-                MachineStatusPill(title: "Wait", value: waitingCount, tint: .yellow)
-                MachineStatusPill(title: "Run", value: runningCount, tint: .green)
-                MachineStatusPill(title: "Done", value: doneCount, tint: .blue)
-                MachineStatusPill(title: "Fail", value: failedCount, tint: .red)
-            }
+            Spacer()
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(Color(.tertiaryLabel))
+                .padding(.top, 14)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -527,43 +601,6 @@ private struct MachineCard: View {
                 .stroke(statusTint.opacity(0.16), lineWidth: 1)
         )
         .shadow(color: AgentMonitorTheme.cardShadow(for: colorScheme), radius: colorScheme == .dark ? 12 : 8, x: 0, y: 3)
-    }
-}
-
-private struct MachineStatusPill: View {
-    let title: String
-    let value: Int
-    let tint: Color
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Circle()
-                .fill(value > 0 ? tint : Color.secondary.opacity(0.3))
-                .frame(width: 6, height: 6)
-            Text("\(title) \(value)")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(value > 0 ? .primary : .secondary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(Color(.tertiarySystemFill), in: Capsule())
-    }
-}
-
-private struct WorkSessionStatusStrip: View {
-    let panes: [Pane]
-
-    var body: some View {
-        HStack(spacing: 8) {
-            WorkSessionMetric(title: "Waiting", value: count(.waiting), tint: .yellow)
-            WorkSessionMetric(title: "Running", value: count(.running), tint: .green)
-            WorkSessionMetric(title: "Done", value: count(.done), tint: .blue)
-            WorkSessionMetric(title: "Failed", value: count(.failed), tint: .red)
-        }
-    }
-
-    private func count(_ status: PaneStatus) -> Int {
-        panes.filter { $0.status == status }.count
     }
 }
 
@@ -601,41 +638,26 @@ private enum StableTimeFormatter {
     }
 }
 
-private struct WorkSessionMetric: View {
-    @Environment(\.colorScheme) private var colorScheme
-    let title: String
-    let value: Int
-    let tint: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text("\(value)")
-                .font(.system(size: 18, weight: .semibold))
-            Text(title)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(AgentMonitorTheme.surface(for: colorScheme).opacity(0.85))
-        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .stroke(tint.opacity(value > 0 ? 0.24 : 0.08), lineWidth: 1)
-        )
-    }
-}
-
 private struct PaneDetailRoute: View {
     let route: PaneNavigationRoute
+    let showsInputBar: Bool
+    let showsNavigationChrome: Bool
+    let terminalHorizontalPadding: CGFloat
 
     @Environment(MonitorStore.self) private var store
     @Environment(AppSettings.self) private var settings
     @State private var lastKnownPane: Pane?
 
-    init(route: PaneNavigationRoute) {
+    init(
+        route: PaneNavigationRoute,
+        showsInputBar: Bool = true,
+        showsNavigationChrome: Bool = true,
+        terminalHorizontalPadding: CGFloat = 3
+    ) {
         self.route = route
+        self.showsInputBar = showsInputBar
+        self.showsNavigationChrome = showsNavigationChrome
+        self.terminalHorizontalPadding = terminalHorizontalPadding
         _lastKnownPane = State(initialValue: route.pane)
     }
 
@@ -658,7 +680,10 @@ private struct PaneDetailRoute: View {
                 PaneDetailView(
                     pane: displayPane,
                     isLiveServer: isRouteActiveServer,
-                    serverName: route.serverName
+                    serverName: route.serverName,
+                    showsInputBar: showsInputBar,
+                    showsNavigationChrome: showsNavigationChrome,
+                    terminalHorizontalPadding: terminalHorizontalPadding
                 )
             } else {
                 ContentUnavailableView(
@@ -823,10 +848,6 @@ private struct PaneListItem: View {
         return pane.session
     }
 
-    private var statusText: String {
-        pane.reason.isEmpty ? pane.status.title : "\(pane.status.title) · \(pane.reason)"
-    }
-
     var body: some View {
         HStack(spacing: 13) {
             AgentAvatar(session: pane.session, size: 44)
@@ -855,16 +876,6 @@ private struct PaneListItem: View {
                     .font(.system(size: 14))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(statusColor(pane.status))
-                        .frame(width: 7, height: 7)
-                    Text(statusText)
-                        .font(.system(size: 13))
-                        .foregroundColor(pane.reason.isEmpty ? statusColor(pane.status) : .secondary)
-                        .lineLimit(1)
-                }
             }
 
             Image(systemName: "chevron.right")

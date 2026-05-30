@@ -5,31 +5,21 @@ Thanks for improving Agent Monitor. Keep changes small, local-first, and easy to
 ## Development
 
 ```bash
-npm install
 cp .env.example .env
-npm run build:web
-npm run start
-```
-
-For frontend iteration:
-
-```bash
-npm run dev:web
+cargo run --manifest-path apps/apple/AgentMonitorService/Cargo.toml
 ```
 
 Before sending a change:
 
 ```bash
-npm run check
-npm run build:web
-npm run check:rust
+cargo check --manifest-path apps/apple/AgentMonitorService/Cargo.toml
 ```
 
 For Apple app changes:
 
 ```bash
-npm run build:mac
-npm run build:ios
+(cd apps/apple && xcodegen generate && xcodebuild -project AgentMonitorApple.xcodeproj -scheme AgentMonitorMac -destination 'platform=macOS' build)
+(cd apps/apple && xcodegen generate && pod install && xcodebuild -workspace AgentMonitorApple.xcworkspace -scheme AgentMonitoriOS -destination 'platform=iOS Simulator,name=iPhone 17' build)
 ```
 
 ## Design Constraints

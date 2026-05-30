@@ -13,18 +13,10 @@ The two apps are separate targets in `AgentMonitorApple.xcodeproj`. They share p
 - XcodeGen
 - CocoaPods
 - Rust toolchain
-- Node.js 20+ at the monorepo root
 
 ## Build
 
-From the monorepo root:
-
-```bash
-npm run build:mac
-npm run build:ios
-```
-
-Or from this directory:
+From this directory:
 
 ```bash
 xcodegen generate
@@ -43,7 +35,7 @@ The current iOS app is optimized for being away from the keyboard:
 - Machines first: Settings can store multiple server profiles, and the home view summarizes each Mac's connection state, active panes, and sessions needing attention.
 - Context handoff: opening a session shows a WeChat-style agent timeline when structured messages are available, while still keeping SwiftTerm terminal access for raw tmux inspection.
 - Remote continuation: the composer supports voice/text input, quick controls, image-to-draft upload, and a Goal button that wraps the next message for long-running agent mode.
-- Best-effort observation: local notifications are emitted for actionable status changes such as waiting, failed, and done. iOS background execution remains system-limited; the optional audio keep-alive is not a push-notification substitute.
+- Best-effort observation: local notifications are emitted for actionable status changes such as waiting, failed, and done. iOS background execution remains system-limited when the app is off-screen.
 
 ## iOS Voice Input
 
@@ -69,7 +61,6 @@ Current iOS release constraints:
 - Supported orientation: portrait only, via `UISupportedInterfaceOrientations`
 - App icon: `iOS/Resources/Assets.xcassets/AppIcon.appiconset`
 - Launch background: `iOS/Resources/Assets.xcassets/LaunchBackground.colorset`
-- Background mode: `audio`, used by the optional best-effort background keep-alive toggle; it is not a guarantee of always-on polling or push delivery
 - Local networking: ATS allows arbitrary loads because the app talks to the Mac service over LAN or Tailscale HTTP
 - Privacy strings: local network, microphone, and speech recognition usage descriptions are required for the current iOS feature set
 
@@ -86,10 +77,10 @@ Do not remove `TARGETED_DEVICE_FAMILY: "1"` unless the iPad layout and orientati
 
 ## TestFlight Upload
 
-From the monorepo root, run the release helper:
+From the monorepo root, run the release helper directly:
 
 ```bash
-npm run tf
+apps/apple/scripts/upload-testflight.sh
 ```
 
 The script increments `AgentMonitoriOS` `CURRENT_PROJECT_VERSION`, runs the
@@ -100,10 +91,10 @@ return `VALID`.
 Common options:
 
 ```bash
-npm run tf -- --dry-run
-npm run tf -- --skip-checks
-npm run tf -- --build-number 44
-npm run tf -- --no-wait
+apps/apple/scripts/upload-testflight.sh --dry-run
+apps/apple/scripts/upload-testflight.sh --skip-checks
+apps/apple/scripts/upload-testflight.sh --build-number 44
+apps/apple/scripts/upload-testflight.sh --no-wait
 ```
 
 The script expects an App Store Connect API key at:
@@ -154,7 +145,7 @@ Common upload failures:
 From the monorepo root:
 
 ```bash
-npm run package:mac
+apps/apple/scripts/package-mac.sh
 ```
 
 The package script:
@@ -164,7 +155,7 @@ The package script:
 3. Embeds the Rust service binary.
 4. Creates `apps/apple/dist/AgentMonitor.dmg`.
 
-The packaged app does not include `node_modules` and does not need Node at runtime.
+The packaged app embeds the Rust service and is self-contained at runtime.
 
 ## macOS Control Center
 

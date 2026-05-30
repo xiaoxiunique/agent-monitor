@@ -22,32 +22,30 @@ Agent Monitor is local-first. It is meant for localhost, a trusted LAN, or a pri
 ## Requirements
 
 - macOS or Linux with tmux
-- Node.js 20+
-- npm
+- Rust toolchain
 - iOS app or macOS companion app for the client UI
 
 ## Repository Layout
 
 ```txt
 .
-├── src/                 # Node reference service
-├── scripts/             # LaunchAgent helpers for the Node service
-└── apps/apple/          # combined macOS + iOS XcodeGen project
+├── scripts/             # LaunchAgent helpers for the Rust service
+└── apps/apple/          # Apple apps and bundled Rust service
+    └── AgentMonitorService/
 ```
 
 ## Start
 
 ```bash
-npm install
 cp .env.example .env
-npm run start
+cargo run --manifest-path apps/apple/AgentMonitorService/Cargo.toml
 ```
 
 Connect the iOS app to the printed service URL, usually through Tailscale or a trusted LAN. Add each Mac as a server profile in iOS Settings when you want one phone to watch multiple machines.
 
 ```bash
 # Optional: require a token if you expose it beyond a trusted LAN.
-AGENT_MONITOR_TOKEN=change-me npm run start
+AGENT_MONITOR_TOKEN=change-me cargo run --manifest-path apps/apple/AgentMonitorService/Cargo.toml
 ```
 
 ## Auto Start on macOS
@@ -105,7 +103,7 @@ codex
 This is intentionally small:
 
 - native iOS multi-server machine dashboard and pane list
-- mobile-first project cards, manual refresh, local status notifications, and optional best-effort screen/background keep-alive
+- mobile-first project cards, manual refresh, local status notifications, and optional screen-awake behavior while the app is in use
 - chat-style project detail timeline with structured agent messages when available
 - recent output tail
 - simple status inference
@@ -118,7 +116,7 @@ This is intentionally small:
 - optional token-gated API/WebSocket
 
 It does not persist history or expose a public account system.
-On iOS, background keep-alive uses the audio background mode as a user-controlled best-effort option. It improves short off-screen monitoring but does not guarantee always-on background polling or push delivery.
+On iOS, background execution remains system-limited when the app is off-screen.
 
 ## Companion Apps
 
@@ -130,10 +128,10 @@ On iOS, background keep-alive uses the audio background mode as a user-controlle
 Useful commands:
 
 ```bash
-npm run check:rust
-npm run build:mac
-npm run build:ios
-npm run package:mac
+cargo check --manifest-path apps/apple/AgentMonitorService/Cargo.toml
+(cd apps/apple && xcodegen generate && xcodebuild -project AgentMonitorApple.xcodeproj -scheme AgentMonitorMac -destination 'platform=macOS' build)
+(cd apps/apple && xcodegen generate && pod install && xcodebuild -workspace AgentMonitorApple.xcworkspace -scheme AgentMonitoriOS -destination 'platform=iOS Simulator,name=iPhone 17' build)
+apps/apple/scripts/package-mac.sh
 ```
 
 ## Documentation

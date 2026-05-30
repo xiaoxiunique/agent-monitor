@@ -734,7 +734,6 @@ final class VoiceInputController {
     @discardableResult
     func start(
         settings: AppSettings,
-        backgroundAudio: BackgroundAudioKeepAlive?,
         diagnosticStartTime: CFTimeInterval = 0,
         notifyStartingImmediately: Bool = true,
         notifyLifecycleState: Bool = true,
@@ -770,14 +769,13 @@ final class VoiceInputController {
         case .tencent:
             startTencent(
                 settings: settings,
-                backgroundAudio: backgroundAudio,
                 diagnosticStartTime: diagnosticStartedAt,
                 onTranscript: onTranscript,
                 onListening: onListening
             )
         case .apple:
             cancelPrepareForImmediateStart(provider: provider)
-            startApple(backgroundAudio: backgroundAudio, onTranscript: onTranscript, onListening: onListening)
+            startApple(onTranscript: onTranscript, onListening: onListening)
         }
 
         logStartTiming("start-returning")
@@ -786,7 +784,6 @@ final class VoiceInputController {
 
     private func startTencent(
         settings: AppSettings,
-        backgroundAudio: BackgroundAudioKeepAlive?,
         diagnosticStartTime: CFTimeInterval,
         onTranscript: @escaping @MainActor (String) -> Void,
         onListening: @escaping @MainActor () -> Void
@@ -798,7 +795,6 @@ final class VoiceInputController {
             isSessionStarting = false
             suppressStartingStateNotification = false
             setPhase(.idle)
-            backgroundAudio?.resumeAfterVoiceInput()
             Haptics.sent(success: false)
             return
         }
@@ -809,13 +805,11 @@ final class VoiceInputController {
         if VoiceInputPermissions.hasMicrophonePermission {
             beginTencentSession(
                 config: config,
-                backgroundAudio: backgroundAudio,
                 diagnosticStartTime: diagnosticStartTime,
                 requestID: requestID,
                 onTranscript: onTranscript,
                 onListening: onListening
             )
-            suspendBackgroundAudioForTencentIfNeeded(backgroundAudio, diagnosticStartTime: diagnosticStartTime)
             return
         }
 
@@ -827,7 +821,6 @@ final class VoiceInputController {
                 self.isSessionStarting = false
                 self.suppressStartingStateNotification = false
                 setPhase(.idle)
-                backgroundAudio?.resumeAfterVoiceInput()
                 Haptics.sent(success: false)
                 return
             }
@@ -835,20 +828,17 @@ final class VoiceInputController {
             await MainActor.run {
                 self.beginTencentSession(
                     config: config,
-                    backgroundAudio: backgroundAudio,
                     diagnosticStartTime: diagnosticStartTime,
                     requestID: requestID,
                     onTranscript: onTranscript,
                     onListening: onListening
                 )
-                self.suspendBackgroundAudioForTencentIfNeeded(backgroundAudio, diagnosticStartTime: diagnosticStartTime)
             }
         }
     }
 
     private func beginTencentSession(
         config: TencentVoiceRecognitionConfig,
-        backgroundAudio: BackgroundAudioKeepAlive?,
         diagnosticStartTime: CFTimeInterval,
         requestID: UInt64,
         onTranscript: @escaping @MainActor (String) -> Void,
@@ -906,7 +896,7 @@ final class VoiceInputController {
             onError: { [weak nextSession] message in
                 guard self.tencentSession === nextSession, self.isActive else { return }
                 self.setErrorMessage(message)
-                self.stop(clearError: false, backgroundAudio: backgroundAudio)
+                self.stop(clearError: false)
                 Haptics.sent(success: false)
             },
             onFinished: { [weak nextSession] text in
@@ -914,7 +904,7 @@ final class VoiceInputController {
                 if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.updateTranscript(text, force: true, onTranscript: onTranscript)
                 }
-                self.stop(backgroundAudio: backgroundAudio)
+                self.stop()
             },
             onVolume: { [weak nextSession] level in
                 guard self.tencentSession === nextSession, self.isActive else { return }
@@ -929,21 +919,7 @@ final class VoiceInputController {
         )
     }
 
-    private func suspendBackgroundAudioForTencentIfNeeded(
-        _ backgroundAudio: BackgroundAudioKeepAlive?,
-        diagnosticStartTime: CFTimeInterval
-    ) {
-        guard let backgroundAudio, backgroundAudio.isRunning else { return }
-        Task { @MainActor in
-            guard backgroundAudio.isRunning else { return }
-            self.logStartTiming("background-audio-suspend-requested")
-            backgroundAudio.suspendForVoiceInputSilently(diagnosticStartedAt: diagnosticStartTime)
-            self.logStartTiming("background-audio-suspend-dispatched")
-        }
-    }
-
     private func startApple(
-        backgroundAudio: BackgroundAudioKeepAlive?,
         onTranscript: @escaping @MainActor (String) -> Void,
         onListening: @escaping @MainActor () -> Void
     ) {
@@ -951,8 +927,7 @@ final class VoiceInputController {
         startID = requestID
 
         if VoiceInputPermissions.hasMicrophonePermission, VoiceInputPermissions.hasSpeechPermission {
-            suspendBackgroundAudioForAppleIfNeeded(backgroundAudio)
-            beginAppleSession(backgroundAudio: backgroundAudio, requestID: requestID, onTranscript: onTranscript, onListening: onListening)
+            beginAppleSession(requestID: requestID, onTranscript: onTranscript, onListening: onListening)
             return
         }
 
@@ -964,24 +939,15 @@ final class VoiceInputController {
                 self.isSessionStarting = false
                 self.suppressStartingStateNotification = false
                 setPhase(.idle)
-                backgroundAudio?.resumeAfterVoiceInput()
                 Haptics.sent(success: false)
                 return
             }
 
-            self.suspendBackgroundAudioForAppleIfNeeded(backgroundAudio)
-            self.beginAppleSession(backgroundAudio: backgroundAudio, requestID: requestID, onTranscript: onTranscript, onListening: onListening)
+            self.beginAppleSession(requestID: requestID, onTranscript: onTranscript, onListening: onListening)
         }
     }
 
-    private func suspendBackgroundAudioForAppleIfNeeded(_ backgroundAudio: BackgroundAudioKeepAlive?) {
-        guard backgroundAudio?.isRunning == true else { return }
-        logStartTiming("background-audio-suspend-requested")
-        backgroundAudio?.suspendForVoiceInputSilently(diagnosticStartedAt: CFAbsoluteTimeGetCurrent())
-    }
-
     private func beginAppleSession(
-        backgroundAudio: BackgroundAudioKeepAlive?,
         requestID: UInt64,
         onTranscript: @escaping @MainActor (String) -> Void,
         onListening: @escaping @MainActor () -> Void
@@ -997,13 +963,13 @@ final class VoiceInputController {
                 self.markListening(.apple)
                 self.updateTranscript(transcript, force: isFinal, onTranscript: onTranscript)
                 if isFinal {
-                    self.stop(backgroundAudio: backgroundAudio)
+                    self.stop()
                 }
             },
             onError: { [weak nextSession] message in
                 guard self.appleSession === nextSession, self.isActive else { return }
                 self.setErrorMessage(message)
-                self.stop(clearError: false, backgroundAudio: backgroundAudio)
+                self.stop(clearError: false)
                 Haptics.sent(success: false)
             },
             onVolume: { [weak nextSession] level in
@@ -1021,7 +987,6 @@ final class VoiceInputController {
 
     func stop(
         clearError: Bool = true,
-        backgroundAudio: BackgroundAudioKeepAlive? = nil,
         keepTencentWarm: Bool = true
     ) {
         if !keepTencentWarm {
@@ -1035,7 +1000,6 @@ final class VoiceInputController {
             warmTencentSession?.stop(keepWarm: false)
             warmTencentSession = nil
             warmTencentConfigKey = nil
-            backgroundAudio?.resumeAfterVoiceInput()
             return
         }
 
@@ -1070,11 +1034,8 @@ final class VoiceInputController {
             if clearError && keepTencentWarm {
                 warmTencentSession = currentTencentSession
                 warmTencentConfigKey = currentTencentConfigKey
-                scheduleWarmTencentSessionClear(backgroundAudio: backgroundAudio)
+                scheduleWarmTencentSessionClear()
             }
-        }
-        if currentTencentSession == nil || !clearError || !keepTencentWarm {
-            backgroundAudio?.resumeAfterVoiceInput()
         }
         suppressLifecycleStateNotifications = false
     }
@@ -1101,7 +1062,7 @@ final class VoiceInputController {
         lastPrepareRequestTime = 0
     }
 
-    private func scheduleWarmTencentSessionClear(backgroundAudio: BackgroundAudioKeepAlive?) {
+    private func scheduleWarmTencentSessionClear() {
         warmTencentClearTask?.cancel()
         warmTencentClearTask = Task {
             try? await Task.sleep(for: .milliseconds(12000))
@@ -1110,7 +1071,6 @@ final class VoiceInputController {
                 self.warmTencentSession = nil
                 self.warmTencentConfigKey = nil
                 self.warmTencentClearTask = nil
-                backgroundAudio?.resumeAfterVoiceInput()
             }
         }
     }

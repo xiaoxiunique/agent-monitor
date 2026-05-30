@@ -17,6 +17,9 @@ struct PaneDetailView: View {
     let pane: Pane
     let isLiveServer: Bool
     let serverName: String
+    let showsInputBar: Bool
+    let showsNavigationChrome: Bool
+    let terminalHorizontalPadding: CGFloat
 
     @Environment(MonitorStore.self) private var store
     @Environment(\.dismiss) private var dismiss
@@ -29,10 +32,20 @@ struct PaneDetailView: View {
     @State private var runtimeDisplayMode: DetailRuntimeDisplayMode = .terminal
     @State private var logRefreshHint: PaneLogRefreshHint?
 
-    init(pane: Pane, isLiveServer: Bool = true, serverName: String = "Server") {
+    init(
+        pane: Pane,
+        isLiveServer: Bool = true,
+        serverName: String = "Server",
+        showsInputBar: Bool = true,
+        showsNavigationChrome: Bool = true,
+        terminalHorizontalPadding: CGFloat = 3
+    ) {
         self.pane = pane
         self.isLiveServer = isLiveServer
         self.serverName = serverName
+        self.showsInputBar = showsInputBar
+        self.showsNavigationChrome = showsNavigationChrome
+        self.terminalHorizontalPadding = terminalHorizontalPadding
         _actionPane = State(initialValue: pane)
     }
 
@@ -52,59 +65,42 @@ struct PaneDetailView: View {
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            InputBar(
-                pane: actionPane,
-                serverName: serverName,
-                isEnabled: isLiveServer,
-                inputText: $inputText,
-                vimMode: $vimMode,
-                showKillConfirmation: $showKillConfirmation,
-                onSendText: { text in
-                    guard isLiveServer else { return false }
-                    let response = await store.sendText(text, to: actionPane, vimMode: vimMode)
-                    return response?.ok == true
-                },
-                onUserMessageSent: { _ in },
-                onRefineText: { text in
-                    await store.refineText(text)
-                },
-                onSendKey: { key in
-                    guard isLiveServer else { return false }
-                    let response = await store.sendKey(key, to: actionPane)
-                    return response?.ok == true
-                },
-                onUploadImage: { imageData in
-                    guard isLiveServer else { throw CancellationError() }
-                    return try await store.uploadImage(imageData, to: actionPane)
-                }
-            )
+            if showsInputBar {
+                InputBar(
+                    pane: actionPane,
+                    serverName: serverName,
+                    isEnabled: isLiveServer,
+                    inputText: $inputText,
+                    vimMode: $vimMode,
+                    showKillConfirmation: $showKillConfirmation,
+                    onSendText: { text in
+                        guard isLiveServer else { return false }
+                        let response = await store.sendText(text, to: actionPane, vimMode: vimMode)
+                        return response?.ok == true
+                    },
+                    onUserMessageSent: { _ in },
+                    onRefineText: { text in
+                        await store.refineText(text)
+                    },
+                    onSendKey: { key in
+                        guard isLiveServer else { return false }
+                        let response = await store.sendKey(key, to: actionPane)
+                        return response?.ok == true
+                    },
+                    onUploadImage: { imageData in
+                        guard isLiveServer else { throw CancellationError() }
+                        return try await store.uploadImage(imageData, to: actionPane)
+                    }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
-        .navigationTitle(projectName)
+        .animation(.easeOut(duration: 0.18), value: showsInputBar)
+        .navigationTitle(showsNavigationChrome ? projectName : "")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 4) {
-                    Button {
-                        KeyboardDismissal.dismiss()
-                    } label: {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                            .font(.system(size: 16))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .accessibilityLabel("Hide keyboard")
-
-                    Button(role: .destructive) {
-                        showKillConfirmation = true
-                    } label: {
-                        Image(systemName: "xmark.rectangle")
-                            .font(.system(size: 16))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .disabled(!isLiveServer)
-                    .accessibilityLabel("Close pane")
-
+            if showsNavigationChrome {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button { showInfo = true } label: {
                         Image(systemName: "info.circle")
                             .font(.system(size: 16))
@@ -115,6 +111,7 @@ struct PaneDetailView: View {
                 }
             }
         }
+        .toolbar(showsNavigationChrome ? .visible : .hidden, for: .navigationBar)
         .confirmationDialog(
             "Close pane \(actionPane.id)?",
             isPresented: $showKillConfirmation,
@@ -163,7 +160,7 @@ struct PaneDetailView: View {
                         onBrowseLogRequest: switchToLogMode
                     )
                     .background(Color.black)
-                    .padding(.horizontal, 3)
+                    .padding(.horizontal, terminalHorizontalPadding)
                     .padding(.top, 2)
                     .padding(.bottom, 0)
                     .transition(.opacity)
@@ -172,7 +169,7 @@ struct PaneDetailView: View {
                         initialPane: actionPane,
                         refreshHint: logRefreshHint
                     )
-                    .padding(.horizontal, 3)
+                    .padding(.horizontal, terminalHorizontalPadding)
                     .padding(.top, 2)
                     .padding(.bottom, 0)
                     .transition(.opacity)
@@ -2481,7 +2478,6 @@ private struct InputBar: View {
     let serverName: String
     let isEnabled: Bool
     @Environment(AppSettings.self) private var settings
-    @Environment(BackgroundAudioKeepAlive.self) private var backgroundAudio
     @Binding var inputText: String
     @Binding var vimMode: Bool
     @Binding var showKillConfirmation: Bool
@@ -2602,7 +2598,7 @@ private struct InputBar: View {
             isCancelingVoice = false
             isFinalizingVoice = false
             inputMode = .voice
-            voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: false)
+            voiceInput.stop(keepTencentWarm: false)
         }
         .onAppear {
             guard isEnabled else { return }
@@ -2717,15 +2713,9 @@ private struct InputBar: View {
     }
 
     private var terminalAccessoryPanel: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    terminalIconButton(
-                        systemImage: "keyboard.chevron.compact.down",
-                        accessibilityLabel: "Hide keyboard",
-                        action: dismissKeyboard
-                    )
-
+                HStack(spacing: 6) {
                     TerminalServerPill(title: serverName)
 
                     goalModeButton
@@ -2746,7 +2736,7 @@ private struct InputBar: View {
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach(quickKeys, id: \.0) { title, key in
                         terminalKeyButton(title) {
                             Task { _ = await onSendKey(key) }
@@ -2875,7 +2865,7 @@ private struct InputBar: View {
     }
 
     private var voiceComposerSurface: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             imagePickerButton(isUploading: isUploadingImage, isDisabled: isInputBusy || voiceDisplayState.isActive)
 
             if isEnabled {
@@ -2926,7 +2916,7 @@ private struct InputBar: View {
     }
 
     private var textComposerSurface: some View {
-        HStack(alignment: .bottom, spacing: 6) {
+        HStack(alignment: .center, spacing: 6) {
             Button {
                 toggleInputMode()
             } label: {
@@ -2949,6 +2939,7 @@ private struct InputBar: View {
                 placeholder: "这里输入..."
             )
             .frame(height: composerTextHeight)
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, 2)
             .padding(.vertical, 12)
 
@@ -3264,7 +3255,6 @@ private struct InputBar: View {
         // keeps a prepared/warm session from onAppear and the previous recording.
         let didStart = voiceInput.start(
             settings: settings,
-            backgroundAudio: backgroundAudio,
             diagnosticStartTime: voiceRuntime.pressStartedAt,
             notifyStartingImmediately: false,
             notifyLifecycleState: false
@@ -3289,7 +3279,7 @@ private struct InputBar: View {
         voiceRuntime.reset()
         voicePrepareTask?.cancel()
         voicePrepareTask = nil
-        voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: keepTencentWarm)
+        voiceInput.stop(keepTencentWarm: keepTencentWarm)
         clearVoiceGestureState()
         if hideOverlay {
             voiceOverlayRuntime.hide()
@@ -3339,7 +3329,7 @@ private struct InputBar: View {
         }
         voiceRuntime.reset()
         clearVoiceGestureState()
-        voiceInput.stop(backgroundAudio: backgroundAudio)
+        voiceInput.stop()
         voiceOverlayRuntime.hide()
         scheduleVoiceInputPrepare(force: true, after: .milliseconds(40))
     }
@@ -3347,7 +3337,7 @@ private struct InputBar: View {
     private func cancelVoiceInput() {
         voiceRuntime.reset()
         clearVoiceGestureState()
-        voiceInput.stop(backgroundAudio: backgroundAudio, keepTencentWarm: true)
+        voiceInput.stop(keepTencentWarm: true)
         voiceOverlayRuntime.hide()
         scheduleVoiceInputPrepare(after: .milliseconds(40))
         triggerVoiceCanceledHaptic()
@@ -3583,37 +3573,37 @@ private struct TerminalAccessoryLabel: View {
             }
         }
         .foregroundColor(foregroundColor)
-        .padding(.horizontal, title == nil ? 0 : 10)
-        .frame(minWidth: minWidth, maxWidth: maxWidth, minHeight: 44)
-        .background(backgroundFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, title == nil ? 0 : 7)
+        .frame(minWidth: minWidth, maxWidth: maxWidth, minHeight: 34)
+        .background(backgroundFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .stroke(strokeColor, lineWidth: 1)
         )
         .opacity(controlIsEnabled && isActive ? 1 : 0.46)
-        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 
     private var labelFont: Font {
         usesMonospacedFont
-            ? .system(size: 15, weight: .semibold, design: .monospaced)
-            : .system(size: 14, weight: .semibold)
+            ? .system(size: 13, weight: .semibold, design: .monospaced)
+            : .system(size: 12, weight: .semibold)
     }
 
     private var iconSize: CGFloat {
-        title == nil ? 20 : 15
+        title == nil ? 16 : 13
     }
 
     private var minWidth: CGFloat {
-        guard let title else { return 52 }
-        if title.count <= 2 { return 52 }
-        if title.count <= 4 { return 58 }
-        return 72
+        guard let title else { return 42 }
+        if title.count <= 2 { return 42 }
+        if title.count <= 4 { return 50 }
+        return 60
     }
 
     private var maxWidth: CGFloat? {
-        guard let title else { return 52 }
-        return title.count > 10 ? 144 : nil
+        guard let title else { return 42 }
+        return title.count > 10 ? 120 : nil
     }
 
     private var foregroundColor: Color {
@@ -4083,6 +4073,9 @@ private struct ComposerIconLabel: View {
             .frame(width: innerSize, height: innerSize)
         }
         .frame(width: 44, height: 44)
+        .alignmentGuide(.firstTextBaseline) { dimensions in
+            dimensions[VerticalAlignment.center]
+        }
         .contentShape(Rectangle())
     }
 

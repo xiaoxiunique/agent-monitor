@@ -3,9 +3,15 @@ set -euo pipefail
 
 label="dev.hcg.agent-monitor"
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
+service_dir="$project_dir/apps/apple/AgentMonitorService"
+service_bin="$service_dir/target/release/agent-monitor-service"
 target_dir="$HOME/Library/LaunchAgents"
 target_plist="$target_dir/$label.plist"
 uid="$(id -u)"
+
+if [[ ! -x "$service_bin" ]]; then
+  cargo build --release --manifest-path "$service_dir/Cargo.toml"
+fi
 
 mkdir -p "$target_dir" "$HOME/Library/Logs"
 cat > "$target_plist" <<PLIST
@@ -20,7 +26,7 @@ cat > "$target_plist" <<PLIST
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>set -a; [ -f .env ] &amp;&amp; source .env; set +a; exec npm run start</string>
+    <string>set -a; [ -f .env ] &amp;&amp; source .env; set +a; exec "$service_bin"</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -51,7 +57,6 @@ cat > "$target_plist" <<PLIST
 PLIST
 
 launchctl bootout "gui/$uid" "$target_plist" >/dev/null 2>&1 || true
-tmux kill-session -t agent-monitor-service >/dev/null 2>&1 || true
 
 launchctl bootstrap "gui/$uid" "$target_plist"
 launchctl enable "gui/$uid/$label"

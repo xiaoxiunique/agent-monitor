@@ -61,8 +61,6 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        UIBackgroundModes:
-          - audio
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: Agent Monitor connects to the local Mac service on your LAN or Tailscale network.

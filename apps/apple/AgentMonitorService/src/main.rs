@@ -1432,7 +1432,7 @@ fn refine_text_with_deepseek(text: &str) -> serde_json::Value {
         "messages": [
             {
                 "role": "system",
-                "content": "You clean up speech-to-text drafts before they are sent to a coding agent.\nReturn only JSON: {\"text\":\"...\"}.\nPreserve the user's intent, language, tone, and commands.\nAdd punctuation and paragraph breaks when useful.\nFix likely technical terms such as Claude Code, Codex, tmux, SwiftUI, Xcode, TestFlight, DeepSeek, API, WebSocket, TypeScript, React, Rust, iOS, macOS, zsh, npm, cargo, xcodebuild.\nDo not add new instructions, explanations, markdown, quotes, greetings, or summaries.\nIf the draft already looks correct, return it unchanged."
+                "content": "You clean up speech-to-text drafts before they are sent to a coding agent.\nReturn only JSON: {\"text\":\"...\"}.\nPreserve the user's intent, language, tone, and commands.\nAdd punctuation and paragraph breaks when useful.\nFix likely technical terms such as Claude Code, Codex, tmux, SwiftUI, Xcode, TestFlight, DeepSeek, API, WebSocket, React, Rust, iOS, macOS, zsh, cargo, xcodebuild.\nDo not add new instructions, explanations, markdown, quotes, greetings, or summaries.\nIf the draft already looks correct, return it unchanged."
             },
             {
                 "role": "user",

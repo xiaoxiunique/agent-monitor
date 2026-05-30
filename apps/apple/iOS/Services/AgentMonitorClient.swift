@@ -164,6 +164,7 @@ struct AgentMonitorClient {
 
         var request = URLRequest(url: url)
         request.httpMethod = method
+        request.timeoutInterval = method == "GET" ? 8 : 15
         setAuthorizationHeader(on: &request)
 
         if let body {

@@ -3,7 +3,7 @@
 ## Ready
 
 - Local-first scope is documented.
-- Node reference service has install and run instructions.
+- Rust service has install and run instructions.
 - macOS LaunchAgent install no longer hardcodes a user-specific path.
 - Optional token auth and private-network assumptions are documented.
 - API surface and architecture are documented.
@@ -13,7 +13,7 @@
 
 ## Before Public Release
 
-- Add CI for typecheck, web build, Rust build, and Swift builds.
+- Add CI for Rust checks and Swift builds.
 - Add release notes and versioning policy.
 - Replace personal bundle identifiers if publishing binaries under an organization.
 - Decide how signed/notarized macOS releases will be distributed.

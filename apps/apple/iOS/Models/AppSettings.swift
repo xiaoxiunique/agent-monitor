@@ -116,10 +116,6 @@ final class AppSettings {
         didSet { defaults.set(keepScreenAwake, forKey: Keys.keepScreenAwake) }
     }
 
-    var backgroundAudioKeepAlive: Bool {
-        didSet { defaults.set(backgroundAudioKeepAlive, forKey: Keys.backgroundAudioKeepAlive) }
-    }
-
     var hasCompletedOnboarding: Bool {
         didSet { defaults.set(hasCompletedOnboarding, forKey: Keys.hasCompletedOnboarding) }
     }
@@ -186,7 +182,6 @@ final class AppSettings {
         let savedInterval = defaults.double(forKey: Keys.refreshInterval)
         refreshInterval = savedInterval == 0 ? 2.5 : savedInterval
         keepScreenAwake = defaults.object(forKey: Keys.keepScreenAwake) as? Bool ?? false
-        backgroundAudioKeepAlive = defaults.object(forKey: Keys.backgroundAudioKeepAlive) as? Bool ?? false
         hasCompletedOnboarding = defaults.object(forKey: Keys.hasCompletedOnboarding) as? Bool
             ?? !activeProfile.url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         voiceRecognitionProviderRaw = defaults.string(forKey: Keys.voiceRecognitionProviderRaw) ?? VoiceRecognitionProvider.tencent.rawValue
@@ -253,7 +248,6 @@ final class AppSettings {
         isApplyingServerProfile = false
         refreshInterval = 2.5
         keepScreenAwake = false
-        backgroundAudioKeepAlive = false
         hasCompletedOnboarding = false
         voiceRecognitionProviderRaw = VoiceRecognitionProvider.tencent.rawValue
         tencentASRAppID = "1316852800"
@@ -358,7 +352,6 @@ final class AppSettings {
         static let activeServerID = "activeServerID"
         static let refreshInterval = "refreshInterval"
         static let keepScreenAwake = "keepScreenAwake"
-        static let backgroundAudioKeepAlive = "backgroundAudioKeepAlive"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
         static let voiceRecognitionProviderRaw = "voiceRecognitionProviderRaw"
         static let tencentASRAppID = "tencentASRAppID"
