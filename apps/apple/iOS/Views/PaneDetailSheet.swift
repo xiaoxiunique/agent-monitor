@@ -26,6 +26,8 @@ struct PaneDetailView: View {
     @State private var actionPane: Pane
     @State private var inputText = ""
     @State private var vimMode = false
+    @State private var runtimeDisplayMode: DetailRuntimeDisplayMode = .terminal
+    @State private var logRefreshHint: PaneLogRefreshHint?
 
     init(pane: Pane, isLiveServer: Bool = true, serverName: String = "Server") {
         self.pane = pane
@@ -153,11 +155,46 @@ struct PaneDetailView: View {
     @ViewBuilder
     private var terminalContent: some View {
         if isLiveServer {
-            TerminalPaneView(pane: actionPane)
-                .background(Color.black)
-                .padding(.horizontal, 3)
-                .padding(.top, 2)
-                .padding(.bottom, 0)
+            ZStack(alignment: .topTrailing) {
+                switch runtimeDisplayMode {
+                case .terminal:
+                    TerminalPaneView(
+                        pane: actionPane,
+                        onBrowseLogRequest: switchToLogMode
+                    )
+                    .background(Color.black)
+                    .padding(.horizontal, 3)
+                    .padding(.top, 2)
+                    .padding(.bottom, 0)
+                    .transition(.opacity)
+                case .log:
+                    PaneRealtimeLogContainer(
+                        initialPane: actionPane,
+                        refreshHint: logRefreshHint
+                    )
+                    .padding(.horizontal, 3)
+                    .padding(.top, 2)
+                    .padding(.bottom, 0)
+                    .transition(.opacity)
+
+                    Button {
+                        runtimeDisplayMode = .terminal
+                    } label: {
+                        Label("Terminal", systemImage: "terminal")
+                            .font(.system(size: 12, weight: .semibold))
+                            .labelStyle(.iconOnly)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.86))
+                    .background(.black.opacity(0.42), in: Circle())
+                    .padding(.top, 10)
+                    .padding(.trailing, 10)
+                    .accessibilityLabel("Return to terminal")
+                }
+            }
+            .animation(.easeOut(duration: 0.16), value: runtimeDisplayMode)
         } else {
             ContentUnavailableView {
                 Label("Terminal paused", systemImage: "terminal")
@@ -171,6 +208,22 @@ struct PaneDetailView: View {
             )
         }
     }
+
+    private func switchToLogMode() {
+        guard runtimeDisplayMode != .log else { return }
+        KeyboardDismissal.dismiss()
+        logRefreshHint = PaneLogRefreshHint(
+            paneId: actionPane.id,
+            tail: actionPane.tail,
+            capturedAt: actionPane.updatedAt
+        )
+        runtimeDisplayMode = .log
+    }
+}
+
+private enum DetailRuntimeDisplayMode: Equatable {
+    case terminal
+    case log
 }
 
 private struct PaneActionSync: View {

@@ -3,17 +3,31 @@ import SwiftUI
 
 struct TerminalScrollUITestHarnessView: View {
     @State private var service = TerminalWebSocketService()
+    @State private var isLogMode = false
 
     var body: some View {
-        SwiftTermView(
-            pane: Self.pane,
-            baseURL: URL(string: "http://127.0.0.1:8797")!,
-            token: "",
-            service: service
-        )
-        .background(Color.black)
-        .ignoresSafeArea()
-        .accessibilityIdentifier("terminal-scroll-harness")
+        if isLogMode {
+            Text("Log Mode")
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.green)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .ignoresSafeArea()
+                .accessibilityIdentifier("terminal-log-mode-harness")
+        } else {
+            SwiftTermView(
+                pane: Self.pane,
+                baseURL: URL(string: "http://127.0.0.1:8797")!,
+                token: "",
+                service: service,
+                onBrowseLogRequest: ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_LOG_SWITCH_UITEST") ? {
+                    isLogMode = true
+                } : nil
+            )
+            .background(Color.black)
+            .ignoresSafeArea()
+            .accessibilityIdentifier("terminal-scroll-harness")
+        }
     }
 
     private static let pane = Pane(
