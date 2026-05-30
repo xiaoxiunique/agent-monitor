@@ -152,13 +152,10 @@ struct PaneDetailView: View {
     @ViewBuilder
     private var terminalContent: some View {
         if isLiveServer {
-            ZStack(alignment: .topTrailing) {
+            ZStack(alignment: .bottomTrailing) {
                 switch runtimeDisplayMode {
                 case .terminal:
-                    TerminalPaneView(
-                        pane: actionPane,
-                        onBrowseLogRequest: switchToLogMode
-                    )
+                    TerminalPaneView(pane: actionPane)
                     .background(Color.black)
                     .padding(.horizontal, terminalHorizontalPadding)
                     .padding(.top, 2)
@@ -173,23 +170,11 @@ struct PaneDetailView: View {
                     .padding(.top, 2)
                     .padding(.bottom, 0)
                     .transition(.opacity)
-
-                    Button {
-                        runtimeDisplayMode = .terminal
-                    } label: {
-                        Label("Terminal", systemImage: "terminal")
-                            .font(.system(size: 12, weight: .semibold))
-                            .labelStyle(.iconOnly)
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.white.opacity(0.86))
-                    .background(.black.opacity(0.42), in: Circle())
-                    .padding(.top, 10)
-                    .padding(.trailing, 10)
-                    .accessibilityLabel("Return to terminal")
                 }
+
+                runtimeToggleButton
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 12)
             }
             .animation(.easeOut(duration: 0.16), value: runtimeDisplayMode)
         } else {
@@ -204,6 +189,35 @@ struct PaneDetailView: View {
                     .ignoresSafeArea()
             )
         }
+    }
+
+    private var runtimeToggleButton: some View {
+        Button {
+            switch runtimeDisplayMode {
+            case .terminal:
+                switchToLogMode()
+            case .log:
+                runtimeDisplayMode = .terminal
+            }
+        } label: {
+            Label(
+                runtimeDisplayMode == .terminal ? "Logs" : "Terminal",
+                systemImage: runtimeDisplayMode == .terminal ? "doc.text.magnifyingglass" : "terminal"
+            )
+            .font(.system(size: 12, weight: .semibold))
+            .padding(.horizontal, 11)
+            .frame(height: 36)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.9))
+        .background(.black.opacity(0.56), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(.white.opacity(0.16), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.32), radius: 10, y: 3)
+        .accessibilityLabel(runtimeDisplayMode == .terminal ? "Open logs" : "Return to terminal")
     }
 
     private func switchToLogMode() {

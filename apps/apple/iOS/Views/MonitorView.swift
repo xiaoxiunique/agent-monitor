@@ -122,8 +122,6 @@ private struct ServerWorkSessionsView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var showingSettings = false
     @State private var selectedPaneRoute: PaneNavigationRoute?
-    @State private var expandedPaneRoute: PaneNavigationRoute?
-    @State private var selectedPaneDetent: PresentationDetent = PaneDetailSheetDetents.preview
 
     private var state: ServerMonitorState {
         store.serverMonitorState(for: profile)
@@ -200,6 +198,9 @@ private struct ServerWorkSessionsView: View {
         }
         .navigationTitle(profile.displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(item: $selectedPaneRoute) { route in
+            PaneDetailRoute(route: route)
+        }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 ConnectionStatusBadge(
@@ -228,52 +229,6 @@ private struct ServerWorkSessionsView: View {
             SettingsView()
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
-        }
-        .sheet(item: $selectedPaneRoute, onDismiss: {
-            selectedPaneDetent = PaneDetailSheetDetents.preview
-        }) { route in
-            NavigationStack {
-                PaneDetailRoute(
-                    route: route,
-                    showsInputBar: false,
-                    showsNavigationChrome: false,
-                    terminalHorizontalPadding: 0
-                )
-            }
-            .presentationDetents([PaneDetailSheetDetents.preview, .large], selection: $selectedPaneDetent)
-            .presentationDragIndicator(.visible)
-            .presentationBackground(.black)
-            .presentationCornerRadius(0)
-        }
-        .fullScreenCover(item: $expandedPaneRoute) { route in
-            NavigationStack {
-                PaneDetailRoute(
-                    route: route,
-                    showsInputBar: true,
-                    showsNavigationChrome: true,
-                    terminalHorizontalPadding: 0
-                )
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button {
-                            expandedPaneRoute = nil
-                        } label: {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 18, weight: .semibold))
-                                .frame(width: 44, height: 44)
-                                .contentShape(Rectangle())
-                        }
-                        .accessibilityLabel("Back")
-                    }
-                }
-            }
-            .interactiveDismissDisabled(true)
-        }
-        .onChange(of: selectedPaneDetent) { _, detent in
-            guard detent == .large, let route = selectedPaneRoute else { return }
-            expandedPaneRoute = route
-            selectedPaneRoute = nil
-            selectedPaneDetent = PaneDetailSheetDetents.preview
         }
     }
 
@@ -415,7 +370,6 @@ private struct ServerWorkSessionsView: View {
             settings.selectServer(profile.id)
             store.start()
         }
-        selectedPaneDetent = PaneDetailSheetDetents.preview
         let route = PaneNavigationRoute(
             pane: pane,
             serverIdentity: settings.activeServerIdentity,
@@ -424,10 +378,6 @@ private struct ServerWorkSessionsView: View {
         selectedPaneRoute = route
         Haptics.sent(success: true)
     }
-}
-
-private enum PaneDetailSheetDetents {
-    static let preview: PresentationDetent = .fraction(0.68)
 }
 
 private struct PaneNavigationRoute: Identifiable, Hashable {
