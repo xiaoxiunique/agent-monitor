@@ -41,7 +41,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.hcg.AgentMonitor
         PRODUCT_NAME: Agent Monitor
         MARKETING_VERSION: "0.1"
-        CURRENT_PROJECT_VERSION: "54"
+        CURRENT_PROJECT_VERSION: "55"
         DEVELOPMENT_TEAM: S77C743756
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1"
