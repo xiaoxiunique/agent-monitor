@@ -2654,9 +2654,7 @@ private struct InputBar: View {
     }
 
     private var normalInputStack: some View {
-        VStack(spacing: 8) {
-            composerSurface
-
+        VStack(spacing: 6) {
             terminalAccessoryPanel
 
             if !isEnabled {
@@ -2681,10 +2679,12 @@ private struct InputBar: View {
                     .padding(.horizontal, 12)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
+
+            composerSurface
         }
-        .padding(.horizontal, 8)
-        .padding(.top, 8)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 7)
+        .padding(.top, 7)
+        .padding(.bottom, 7)
         .background {
             terminalPanelColor
                 .ignoresSafeArea(edges: .bottom)
@@ -2727,9 +2727,9 @@ private struct InputBar: View {
     }
 
     private var terminalAccessoryPanel: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 5) {
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     TerminalServerPill(title: serverName)
 
                     goalModeButton
@@ -2750,7 +2750,7 @@ private struct InputBar: View {
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     ForEach(quickKeys, id: \.0) { title, key in
                         terminalKeyButton(title) {
                             Task { _ = await onSendKey(key) }
@@ -2915,12 +2915,12 @@ private struct InputBar: View {
             .disabled(isVoiceInteractionActive || isInputBusy)
             .accessibilityLabel("Switch to keyboard input")
         }
-        .padding(.horizontal, 8)
-        .frame(height: 52)
+        .padding(.horizontal, 7)
+        .frame(height: 48)
         .frame(maxWidth: .infinity)
-        .background(terminalFieldColor, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(terminalFieldColor, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
         )
         .onAppear {
@@ -2955,7 +2955,7 @@ private struct InputBar: View {
             .frame(height: composerTextHeight)
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 2)
-            .padding(.vertical, 12)
+            .padding(.vertical, 10)
 
             if isLongDraft {
                 Button {
@@ -2993,12 +2993,12 @@ private struct InputBar: View {
             .disabled(!canSendText)
             .accessibilityLabel("Send message")
         }
-        .padding(.horizontal, 8)
-        .frame(minHeight: 52)
+        .padding(.horizontal, 7)
+        .frame(minHeight: 48)
         .frame(maxWidth: .infinity)
-        .background(terminalFieldColor, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .background(terminalFieldColor, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
         )
     }
@@ -3542,11 +3542,11 @@ private struct TerminalServerPill: View {
                 .minimumScaleFactor(0.78)
         }
         .foregroundColor(.primary.opacity(0.84))
-        .padding(.horizontal, 12)
-        .frame(minWidth: 74, maxWidth: 132, minHeight: 44)
-        .background(serverFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, 10)
+        .frame(minWidth: 68, maxWidth: 124, minHeight: 38)
+        .background(serverFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .stroke(AgentMonitorTheme.separator(for: colorScheme), lineWidth: 1)
         )
         .accessibilityElement(children: .combine)
@@ -3587,37 +3587,37 @@ private struct TerminalAccessoryLabel: View {
             }
         }
         .foregroundColor(foregroundColor)
-        .padding(.horizontal, title == nil ? 0 : 7)
-        .frame(minWidth: minWidth, maxWidth: maxWidth, minHeight: 34)
-        .background(backgroundFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .padding(.horizontal, title == nil ? 0 : 6)
+        .frame(minWidth: minWidth, maxWidth: maxWidth, minHeight: 30)
+        .background(backgroundFill, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .stroke(strokeColor, lineWidth: 1)
         )
         .opacity(controlIsEnabled && isActive ? 1 : 0.46)
-        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 
     private var labelFont: Font {
         usesMonospacedFont
-            ? .system(size: 13, weight: .semibold, design: .monospaced)
-            : .system(size: 12, weight: .semibold)
+            ? .system(size: 12, weight: .semibold, design: .monospaced)
+            : .system(size: 11, weight: .semibold)
     }
 
     private var iconSize: CGFloat {
-        title == nil ? 16 : 13
+        title == nil ? 15 : 12
     }
 
     private var minWidth: CGFloat {
-        guard let title else { return 42 }
-        if title.count <= 2 { return 42 }
-        if title.count <= 4 { return 50 }
-        return 60
+        guard let title else { return 38 }
+        if title.count <= 2 { return 38 }
+        if title.count <= 4 { return 46 }
+        return 56
     }
 
     private var maxWidth: CGFloat? {
-        guard let title else { return 42 }
-        return title.count > 10 ? 120 : nil
+        guard let title else { return 38 }
+        return title.count > 10 ? 108 : nil
     }
 
     private var foregroundColor: Color {
@@ -4086,7 +4086,7 @@ private struct ComposerIconLabel: View {
             .foregroundColor(iconForegroundColor)
             .frame(width: innerSize, height: innerSize)
         }
-        .frame(width: 44, height: 44)
+        .frame(width: 40, height: 40)
         .alignmentGuide(.firstTextBaseline) { dimensions in
             dimensions[VerticalAlignment.center]
         }
@@ -4116,9 +4116,9 @@ private struct ComposerIconLabel: View {
     private var innerSize: CGFloat {
         switch variant {
         case .plain:
-            38
+            34
         case .softCircle, .filledCircle:
-            36
+            32
         }
     }
 
@@ -4143,17 +4143,17 @@ private struct ComposerIconLabel: View {
     private var iconSize: CGFloat {
         switch systemImage {
         case "keyboard":
-            20
+            18
         case "arrow.up":
-            18
-        case "camera":
-            18
-        case "waveform":
-            19
-        case "arrow.up.left.and.arrow.down.right":
             16
+        case "camera":
+            16
+        case "waveform":
+            17
+        case "arrow.up.left.and.arrow.down.right":
+            14
         default:
-            21
+            18
         }
     }
 }

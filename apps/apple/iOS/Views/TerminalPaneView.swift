@@ -3,7 +3,6 @@ import SwiftTerm
 
 struct TerminalPaneView: View {
     let pane: Pane
-    var onBrowseLogRequest: (() -> Void)? = nil
 
     @Environment(MonitorStore.self) private var store
     @Environment(\.scenePhase) private var scenePhase
@@ -16,8 +15,7 @@ struct TerminalPaneView: View {
                     pane: pane,
                     baseURL: client.baseURL,
                     token: client.token,
-                    service: service,
-                    onBrowseLogRequest: onBrowseLogRequest
+                    service: service
                 )
             } else {
                 ContentUnavailableView(
@@ -45,10 +43,9 @@ struct SwiftTermView: UIViewRepresentable {
     let baseURL: URL
     let token: String
     let service: TerminalWebSocketService
-    var onBrowseLogRequest: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(service: service, onBrowseLogRequest: onBrowseLogRequest)
+        Coordinator(service: service)
     }
 
     @MainActor
@@ -124,11 +121,8 @@ struct SwiftTermView: UIViewRepresentable {
         private weak var inputGestureHostView: UIView?
         private var scrollGesture: UIPanGestureRecognizer?
         private var focusTapGesture: UITapGestureRecognizer?
-        private var browseLogLongPressGesture: UILongPressGestureRecognizer?
-        private let onBrowseLogRequest: (() -> Void)?
         private var pendingScrollDelta: CGFloat = 0
         private var hasReportedScrollForCurrentGesture = false
-        private var hasRequestedLogModeForCurrentGesture = false
         private var isTerminalScrollGestureActive = false
         private var queuedScrollLines = 0
         private var scrollFlushWorkItem: DispatchWorkItem?
@@ -137,9 +131,8 @@ struct SwiftTermView: UIViewRepresentable {
         private var inertiaRemainder: CGFloat = 0
         private var lastInertiaTimestamp: CFTimeInterval = 0
 
-        init(service: TerminalWebSocketService, onBrowseLogRequest: (() -> Void)?) {
+        init(service: TerminalWebSocketService) {
             self.service = service
-            self.onBrowseLogRequest = onBrowseLogRequest
         }
 
         deinit {
@@ -167,21 +160,12 @@ struct SwiftTermView: UIViewRepresentable {
             (terminalView as? AgentMonitorTerminalView)?.disableNativePanGestures()
             scrollGesture = gesture
 
-            let longPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleBrowseLogLongPress(_:)))
-            longPressGesture.minimumPressDuration = 0.35
-            longPressGesture.allowableMovement = 18
-            longPressGesture.cancelsTouchesInView = true
-            longPressGesture.delegate = self
-            hostView.addGestureRecognizer(longPressGesture)
-            browseLogLongPressGesture = longPressGesture
-
             let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleFocusTap(_:)))
             tapGesture.cancelsTouchesInView = true
             tapGesture.delaysTouchesBegan = false
             tapGesture.delaysTouchesEnded = false
             tapGesture.delegate = self
             tapGesture.require(toFail: gesture)
-            tapGesture.require(toFail: longPressGesture)
             hostView.addGestureRecognizer(tapGesture)
             focusTapGesture = tapGesture
         }
@@ -198,18 +182,9 @@ struct SwiftTermView: UIViewRepresentable {
                 isTerminalScrollGestureActive = true
                 pendingScrollDelta = 0
                 hasReportedScrollForCurrentGesture = false
-                hasRequestedLogModeForCurrentGesture = false
                 updateScrollAccessibilityValue("began")
-                if onBrowseLogRequest != nil {
-                    requestBrowseLogMode()
-                    return
-                }
             case .changed:
                 isTerminalScrollGestureActive = true
-                if onBrowseLogRequest != nil {
-                    requestBrowseLogMode()
-                    return
-                }
                 let cellHeight = max(terminalView.caretFrame.height, 12)
                 pendingScrollDelta += translation.y / cellHeight
                 let wholeLines = Int(pendingScrollDelta)
@@ -219,11 +194,6 @@ struct SwiftTermView: UIViewRepresentable {
                 hasReportedScrollForCurrentGesture = true
                 updateScrollAccessibilityValue("scroll:\(wholeLines)")
             case .ended, .cancelled, .failed:
-                if onBrowseLogRequest != nil {
-                    pendingScrollDelta = 0
-                    isTerminalScrollGestureActive = false
-                    return
-                }
                 let cellHeight = max(terminalView.caretFrame.height, 12)
                 let velocity = gesture.velocity(in: terminalView).y / cellHeight
                 startInertia(velocityLinesPerSecond: velocity)
@@ -238,23 +208,9 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         @MainActor
-        @objc private func handleBrowseLogLongPress(_ gesture: UILongPressGestureRecognizer) {
-            guard gesture.state == .began else { return }
-            requestBrowseLogMode()
-        }
-
-        @MainActor
         @objc private func handleFocusTap(_ gesture: UITapGestureRecognizer) {
             guard gesture.state == .ended else { return }
             _ = terminalView?.becomeFirstResponder()
-        }
-
-        @MainActor
-        private func requestBrowseLogMode() {
-            guard !hasRequestedLogModeForCurrentGesture else { return }
-            hasRequestedLogModeForCurrentGesture = true
-            updateScrollAccessibilityValue("log-mode")
-            onBrowseLogRequest?()
         }
 
         private func queueScroll(lines: Int) {
@@ -521,9 +477,6 @@ extension SwiftTermView.Coordinator: UIGestureRecognizerDelegate {
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         if gestureRecognizer === focusTapGesture || otherGestureRecognizer === focusTapGesture {
-            return false
-        }
-        if gestureRecognizer === browseLogLongPressGesture || otherGestureRecognizer === browseLogLongPressGesture {
             return false
         }
         return gestureRecognizer === scrollGesture || otherGestureRecognizer === scrollGesture
