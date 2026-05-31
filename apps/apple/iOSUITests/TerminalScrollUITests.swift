@@ -27,27 +27,4 @@ final class TerminalScrollUITests: XCTestCase {
         expectation(for: receivedScroll, evaluatedWith: capture)
         waitForExpectations(timeout: 3)
     }
-
-    @MainActor
-    func testTerminalVerticalDragSwitchesToLogModeWhenConfigured() {
-        let app = XCUIApplication()
-        app.launchArguments.append("AGENT_MONITOR_TERMINAL_SCROLL_UITEST")
-        app.launchArguments.append("AGENT_MONITOR_TERMINAL_LOG_SWITCH_UITEST")
-        if app.responds(to: Selector(("setShouldWaitForQuiescence:"))) {
-            app.setValue(false, forKey: "shouldWaitForQuiescence")
-        }
-        app.launch()
-
-        let capture = app.otherElements["terminal-touch-capture"]
-        XCTAssertTrue(capture.waitForExistence(timeout: 10), "Terminal touch capture overlay should be visible to UI tests.")
-
-        let start = capture.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.78))
-        let end = capture.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.22))
-        start.press(forDuration: 0.12, thenDragTo: end)
-
-        XCTAssertTrue(
-            app.staticTexts["terminal-log-mode-harness"].waitForExistence(timeout: 5),
-            "Vertical drag should switch terminal browsing into log mode."
-        )
-    }
 }

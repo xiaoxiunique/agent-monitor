@@ -44,6 +44,14 @@ struct SwiftTermView: UIViewRepresentable {
     let token: String
     let service: TerminalWebSocketService
 
+    private var skipsConnectionForScrollUITest: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_SCROLL_UITEST")
+        #else
+        false
+        #endif
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             service: service,
@@ -69,11 +77,13 @@ struct SwiftTermView: UIViewRepresentable {
         context.coordinator.terminalView = tv
         container.install(terminalView: tv)
         context.coordinator.installInputGestures(on: container.touchCaptureView, terminalView: tv)
+        container.updateConnectionState(service.state)
 
         service.onData = { [weak tv] text in
             tv?.feed(text: text)
         }
-        service.onStateChange = { [weak tv] newState in
+        service.onStateChange = { [weak tv, weak container] newState in
+            container?.updateConnectionState(newState)
             switch newState {
             case .closed(let code):
                 tv?.feed(text: "\r\n[session closed, exit code: \(code ?? 0)]")
@@ -86,13 +96,7 @@ struct SwiftTermView: UIViewRepresentable {
             }
         }
 
-        #if DEBUG
-        let skipConnectionForScrollUITest = ProcessInfo.processInfo.arguments.contains("AGENT_MONITOR_TERMINAL_SCROLL_UITEST")
-        #else
-        let skipConnectionForScrollUITest = false
-        #endif
-
-        if !skipConnectionForScrollUITest {
+        if !skipsConnectionForScrollUITest {
             // Defer connection so the view has laid out and SwiftTerm knows its size.
             DispatchQueue.main.async {
                 let terminal = tv.getTerminal()
@@ -109,7 +113,19 @@ struct SwiftTermView: UIViewRepresentable {
         return container
     }
 
-    func updateUIView(_ uiView: TerminalContainerView, context: Context) {}
+    func updateUIView(_ uiView: TerminalContainerView, context: Context) {
+        uiView.updateConnectionState(service.state)
+        guard !skipsConnectionForScrollUITest else { return }
+        guard let terminalView = uiView.terminalView else { return }
+        let terminal = terminalView.getTerminal()
+        service.connect(with: .init(
+            baseURL: baseURL,
+            token: token,
+            paneId: pane.id,
+            cols: terminal.cols,
+            rows: terminal.rows
+        ))
+    }
 
     static func dismantleUIView(_ uiView: TerminalContainerView, coordinator: Coordinator) {
         coordinator.invalidate()
@@ -183,6 +199,7 @@ struct SwiftTermView: UIViewRepresentable {
 
             guard isReadyForTerminalScroll else {
                 stopInertia()
+                flushQueuedScroll()
                 pendingScrollDelta = 0
                 isTerminalScrollGestureActive = false
                 hasReportedScrollForCurrentGesture = false
@@ -377,17 +394,21 @@ struct SwiftTermView: UIViewRepresentable {
 final class TerminalContainerView: UIView {
     private(set) weak var terminalView: TerminalView?
     let touchCaptureView = UIView()
+    private let statusContainer = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    private let statusLabel = UILabel()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
         configureTouchCaptureView()
+        configureStatusView()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         backgroundColor = .black
         configureTouchCaptureView()
+        configureStatusView()
     }
 
     @MainActor
@@ -396,6 +417,7 @@ final class TerminalContainerView: UIView {
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(terminalView)
         addSubview(touchCaptureView)
+        addSubview(statusContainer)
         NSLayoutConstraint.activate([
             terminalView.leadingAnchor.constraint(equalTo: leadingAnchor),
             terminalView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -405,7 +427,33 @@ final class TerminalContainerView: UIView {
             touchCaptureView.trailingAnchor.constraint(equalTo: trailingAnchor),
             touchCaptureView.topAnchor.constraint(equalTo: topAnchor),
             touchCaptureView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            statusContainer.centerXAnchor.constraint(equalTo: centerXAnchor),
+            statusContainer.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 10),
+            statusContainer.heightAnchor.constraint(equalToConstant: 30),
+            statusContainer.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -24),
         ])
+    }
+
+    @MainActor
+    func updateConnectionState(_ state: TerminalWebSocketService.State) {
+        let text: String?
+        switch state {
+        case .connecting:
+            text = "Connecting terminal..."
+        case .disconnected:
+            text = "Reconnecting terminal..."
+        case .error(let message):
+            text = "Terminal error: \(message)"
+        case .closed:
+            text = "Terminal session closed"
+        case .connected:
+            text = nil
+        }
+
+        statusLabel.text = text
+        UIView.animate(withDuration: 0.16) {
+            self.statusContainer.alpha = text == nil ? 0 : 1
+        }
     }
 
     private func configureTouchCaptureView() {
@@ -418,6 +466,27 @@ final class TerminalContainerView: UIView {
             touchCaptureView.accessibilityLabel = "Terminal touch capture"
             touchCaptureView.accessibilityValue = "idle"
         }
+    }
+
+    private func configureStatusView() {
+        statusContainer.translatesAutoresizingMaskIntoConstraints = false
+        statusContainer.alpha = 0
+        statusContainer.isUserInteractionEnabled = false
+        statusContainer.layer.cornerRadius = 15
+        statusContainer.layer.masksToBounds = true
+
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        statusLabel.textColor = UIColor.white.withAlphaComponent(0.9)
+        statusLabel.numberOfLines = 1
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusContainer.contentView.addSubview(statusLabel)
+
+        NSLayoutConstraint.activate([
+            statusLabel.leadingAnchor.constraint(equalTo: statusContainer.contentView.leadingAnchor, constant: 12),
+            statusLabel.trailingAnchor.constraint(equalTo: statusContainer.contentView.trailingAnchor, constant: -12),
+            statusLabel.centerYAnchor.constraint(equalTo: statusContainer.contentView.centerYAnchor),
+        ])
     }
 }
 

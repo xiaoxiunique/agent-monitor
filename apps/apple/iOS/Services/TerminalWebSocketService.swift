@@ -26,15 +26,25 @@ final class TerminalWebSocketService {
 
     private var wsTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var readinessTimeoutTask: Task<Void, Never>?
     private var lastParameters: ConnectionParameters?
     private var connectionKey: String?
+    private var reconnectAttempt = 0
+    private var pendingResize: (cols: Int, rows: Int)?
 
     func connect(with params: ConnectionParameters, force: Bool = false) {
         let nextConnectionKey = connectionKey(for: params)
         if !force, connectionKey == nextConnectionKey, wsTask != nil {
+            let sizeChanged = lastParameters?.cols != params.cols || lastParameters?.rows != params.rows
+            lastParameters = params
+            if sizeChanged {
+                sendResize(cols: params.cols, rows: params.rows)
+            }
             return
         }
 
+        cancelReconnect()
         closeCurrentTask(notifyDisconnected: false, clearParameters: false)
         lastParameters = params
         connectionKey = nextConnectionKey
@@ -74,55 +84,92 @@ final class TerminalWebSocketService {
         receiveTask = Task { [weak self] in
             await self?.receiveLoop(task)
         }
+        scheduleReadinessTimeout(for: task)
     }
 
     func reconnectIfPossible() {
         guard let params = lastParameters else { return }
+        if wsTask != nil, state == .connected || state == .connecting {
+            return
+        }
         connect(with: params, force: true)
     }
 
     func suspendForBackground() {
+        cancelReconnect()
+        cancelReadinessTimeout()
         closeCurrentTask(notifyDisconnected: false, clearParameters: false)
         if state == .connected || state == .connecting {
             state = .disconnected
+            onStateChange?(.disconnected)
         }
     }
 
     func sendInput(_ text: String) {
-        guard let wsTask, isReadyForInteraction else { return }
+        guard !text.isEmpty else { return }
+        guard isInteractionRecoverable else { return }
         let msg = "{\"type\":\"input\",\"data\":\(jsonEscape(text))}"
-        wsTask.send(.string(msg)) { _ in }
+        guard isReadyForInteraction else {
+            scheduleReconnectIfPossible()
+            return
+        }
+        sendMessage(msg)
     }
 
     func sendResize(cols: Int, rows: Int) {
         updateStoredTerminalSize(cols: cols, rows: rows)
-        guard let wsTask, isReadyForInteraction else { return }
+        guard isInteractionRecoverable else { return }
         let msg = "{\"type\":\"resize\",\"cols\":\(cols),\"rows\":\(rows)}"
-        wsTask.send(.string(msg)) { _ in }
+        guard isReadyForInteraction else {
+            pendingResize = (cols, rows)
+            scheduleReconnectIfPossible()
+            return
+        }
+        sendMessage(msg) { [weak self] in
+            self?.pendingResize = (cols, rows)
+        }
     }
 
     func sendScroll(lines: Int) {
-        guard let wsTask, isReadyForInteraction else { return }
+        guard isInteractionRecoverable else { return }
         let safeLines = max(-200, min(200, lines))
         guard safeLines != 0 else { return }
         let msg = "{\"type\":\"scroll\",\"lines\":\(safeLines)}"
-        wsTask.send(.string(msg)) { _ in }
+        guard isReadyForInteraction else {
+            scheduleReconnectIfPossible()
+            return
+        }
+        sendMessage(msg)
     }
 
     func disconnect() {
+        cancelReconnect()
+        cancelReadinessTimeout()
         closeCurrentTask(notifyDisconnected: true, clearParameters: true)
     }
 
     // MARK: - Private
 
+    private var isInteractionRecoverable: Bool {
+        switch state {
+        case .closed, .error:
+            false
+        case .disconnected, .connecting, .connected:
+            true
+        }
+    }
+
     private func closeCurrentTask(notifyDisconnected: Bool, clearParameters: Bool) {
         receiveTask?.cancel()
         receiveTask = nil
+        readinessTimeoutTask?.cancel()
+        readinessTimeoutTask = nil
         let task = wsTask
         wsTask = nil
         connectionKey = nil
         if clearParameters {
             lastParameters = nil
+            clearQueuedInteraction()
         }
         let wasActive = state == .connected || state == .connecting
         if notifyDisconnected, wasActive {
@@ -137,8 +184,6 @@ final class TerminalWebSocketService {
             params.baseURL.absoluteString,
             params.token,
             params.paneId,
-            String(params.cols),
-            String(params.rows),
         ].joined(separator: "\n")
     }
 
@@ -153,6 +198,98 @@ final class TerminalWebSocketService {
         )
         lastParameters = updatedParams
         connectionKey = connectionKey(for: updatedParams)
+    }
+
+    private func clearQueuedInteraction() {
+        pendingResize = nil
+    }
+
+    private func flushQueuedInteraction() {
+        if let pendingResize {
+            self.pendingResize = nil
+            sendResize(cols: pendingResize.cols, rows: pendingResize.rows)
+        }
+    }
+
+    private func sendMessage(_ message: String, recover: (@MainActor () -> Void)? = nil) {
+        guard let task = wsTask, isReadyForInteraction else {
+            recover?()
+            if state == .disconnected {
+                scheduleReconnectIfPossible()
+            }
+            return
+        }
+        task.send(.string(message)) { [weak self, task] error in
+            guard error != nil else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                recover?()
+                if self.wsTask === task {
+                    self.handleTransportFailure(for: task)
+                } else if self.isReadyForInteraction {
+                    self.flushQueuedInteraction()
+                } else if self.state == .disconnected {
+                    self.scheduleReconnectIfPossible()
+                }
+            }
+        }
+    }
+
+    private func handleTransportFailure(for task: URLSessionWebSocketTask) {
+        guard wsTask === task else { return }
+        closeCurrentTask(notifyDisconnected: false, clearParameters: false)
+        state = .disconnected
+        onStateChange?(.disconnected)
+        scheduleReconnectIfPossible()
+    }
+
+    private func scheduleReconnectIfPossible() {
+        guard lastParameters != nil else { return }
+        guard reconnectTask == nil else { return }
+        switch state {
+        case .disconnected:
+            break
+        case .connecting, .connected, .closed, .error:
+            return
+        }
+
+        reconnectAttempt += 1
+        let delayMilliseconds = min(3_000, 250 * (1 << min(reconnectAttempt - 1, 4)))
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+            self?.runScheduledReconnect()
+        }
+    }
+
+    private func runScheduledReconnect() {
+        reconnectTask = nil
+        guard state != .connected else { return }
+        guard let params = lastParameters else { return }
+        connect(with: params, force: true)
+    }
+
+    private func cancelReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+    }
+
+    private func scheduleReadinessTimeout(for task: URLSessionWebSocketTask) {
+        readinessTimeoutTask?.cancel()
+        readinessTimeoutTask = Task { [weak self, weak task] in
+            try? await Task.sleep(for: .seconds(6))
+            await MainActor.run {
+                guard let self, let task, self.wsTask === task, self.state == .connecting else { return }
+                self.closeCurrentTask(notifyDisconnected: false, clearParameters: false)
+                self.state = .disconnected
+                self.onStateChange?(.disconnected)
+                self.scheduleReconnectIfPossible()
+            }
+        }
+    }
+
+    private func cancelReadinessTimeout() {
+        readinessTimeoutTask?.cancel()
+        readinessTimeoutTask = nil
     }
 
     private func receiveLoop(_ task: URLSessionWebSocketTask) async {
@@ -200,19 +337,30 @@ final class TerminalWebSocketService {
 
     private func markTaskConnected(_ task: URLSessionWebSocketTask) {
         guard wsTask === task else { return }
+        reconnectAttempt = 0
+        cancelReconnect()
+        cancelReadinessTimeout()
         if state != .connected {
             state = .connected
             onStateChange?(.connected)
         }
+        flushQueuedInteraction()
     }
 
     private func markTaskClosed(_ task: URLSessionWebSocketTask, state nextState: State) {
         guard wsTask === task else { return }
         receiveTask = nil
+        readinessTimeoutTask?.cancel()
+        readinessTimeoutTask = nil
         wsTask = nil
         connectionKey = nil
         state = nextState
         onStateChange?(nextState)
+        if nextState == .disconnected {
+            scheduleReconnectIfPossible()
+        } else {
+            clearQueuedInteraction()
+        }
     }
 
     private func jsonEscape(_ s: String) -> String {
