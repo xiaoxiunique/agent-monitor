@@ -7,6 +7,7 @@ struct MonitorView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(\.colorScheme) private var colorScheme
     @State private var showingSettings = false
+    @State private var showingAgentTools = false
 
     private var serverProfiles: [ServerProfile] {
         settings.serverProfiles
@@ -64,6 +65,11 @@ struct MonitorView: View {
                     .presentationDetents([.large])
                     .presentationDragIndicator(.visible)
             }
+            .sheet(isPresented: $showingAgentTools) {
+                AgentToolsView()
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            }
             .animation(.agentThemeChange, value: colorScheme)
         }
     }
@@ -91,17 +97,29 @@ struct MonitorView: View {
 
             Spacer()
 
-            Button {
-                Task {
-                    await store.refresh()
-                    await store.refreshAllServerStates()
+            HStack(spacing: 16) {
+                Button {
+                    showingAgentTools = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 20))
+                        .foregroundColor(.primary)
                 }
-            } label: {
-                Image(systemName: store.isLoading ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
-                    .font(.system(size: 20))
-                    .foregroundColor(.primary)
+                .accessibilityLabel("Open agent tools")
+
+                Button {
+                    Task {
+                        await store.refresh()
+                        await store.refreshAllServerStates()
+                    }
+                } label: {
+                    Image(systemName: store.isLoading ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                        .font(.system(size: 20))
+                        .foregroundColor(.primary)
+                }
+                .disabled(store.isLoading)
+                .accessibilityLabel("Refresh")
             }
-            .disabled(store.isLoading)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -121,6 +139,7 @@ private struct ServerWorkSessionsView: View {
     @Environment(AppSettings.self) private var settings
     @Environment(\.colorScheme) private var colorScheme
     @State private var showingSettings = false
+    @State private var showingAgentTools = false
     @State private var selectedPaneRoute: PaneNavigationRoute?
 
     private var state: ServerMonitorState {
@@ -206,16 +225,21 @@ private struct ServerWorkSessionsView: View {
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button {
-                    showingSettings = true
+                    showingAgentTools = true
                 } label: {
-                    Image(systemName: "gearshape")
+                    Image(systemName: "slider.horizontal.3")
                         .font(.system(size: 16, weight: .semibold))
                 }
-                .accessibilityLabel("Configure \(profile.displayName)")
+                .accessibilityLabel("Open agent tools for \(profile.displayName)")
             }
         }
         .sheet(isPresented: $showingSettings) {
             SettingsView()
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showingAgentTools) {
+            AgentToolsView()
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }

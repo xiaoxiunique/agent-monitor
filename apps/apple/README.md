@@ -49,10 +49,10 @@ AppID default only; enter `SecretId` and `SecretKey` on device before using Tenc
 Do not commit Tencent `SecretKey` or other long-lived credentials. A server-issued STS
 temporary credential flow is the preferred production direction.
 
-## iOS CC Switch
+## iOS Agent Tools
 
-The iOS Settings screen includes a `CC Switch` section for the currently active
-Mac server. It lists Claude Code and Codex providers from the Mac's local
+The project list toolbar opens an `Agent Tools` sheet with a `CC Switch` section
+for the selected Mac server. It lists Claude Code and Codex providers from the Mac's local
 `~/.cc-switch/cc-switch.db`, shows the active provider, displays base URL and
 API key presence, and can switch providers through AgentMonitorService.
 
